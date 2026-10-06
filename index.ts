@@ -19,6 +19,7 @@ import {
 	cancelSubagent,
 	killPidTree,
 	sendSubagentMessage,
+	settleExternalKills,
 	startSubagent,
 	terminateOwnedSubagents,
 } from "./spawn-agent.ts";
@@ -477,7 +478,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		for (const record of records.slice().reverse()) {
 			try {
 				if (isTerminalStatus(record.status)) {
-					if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
+					if (record.pid && isProcessAlive(record.pid)) await killPidTree(record.pid, record.pidStartTime);
 				} else {
 					cancelSubagent(agentDir, record);
 				}
@@ -485,7 +486,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				// Cross-process cleanup is best effort. Owned children are awaited below.
 			}
 		}
-		await terminateOwnedSubagents(records.map((record) => record.runId));
+		try {
+			await settleExternalKills();
+			await terminateOwnedSubagents(records.map((record) => record.runId));
+		} catch {
+			// A failed taskkill must not take down the exiting session.
+		}
 		await consumerStopped;
 	});
 
