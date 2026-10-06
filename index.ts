@@ -367,8 +367,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					panel = new SubagentPanel(tui, theme, getAgentDir(), runtime!.runId, {
 						onMessage: async (record, text) => sendToRecord(record, text),
 						onCancel: (record) => {
-							const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
-							if (!isTerminalStatus(latest.status)) trackChild(cancelSubagent(getAgentDir(), latest));
+							try {
+								const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
+								if (!isTerminalStatus(latest.status)) trackChild(cancelSubagent(getAgentDir(), latest));
+							} catch {
+								// This key is delivered on stdin. A lock timeout or a rename
+								// EPERM would otherwise exit Pi before session_shutdown.
+							}
 						},
 					});
 					if (editor) panel.setEditor(editor);

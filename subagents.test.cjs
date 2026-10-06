@@ -2058,6 +2058,30 @@ function check(name, cond, extra) {
 	check("review still opens history", tree.openReview() === true);
 	tree.dispose();
 
+	const cancelDir = path.join(sandbox, "cancel-key");
+	fs.mkdirSync(cancelDir, { recursive: true });
+	registry.saveRecord(cancelDir, mk("root", ""));
+	registry.saveRecord(cancelDir, mk("busy", "root", { status: "running_tool" }));
+	let cancelAttempts = 0;
+	let escaped = false;
+	const cancelPanel = new SubagentPanel(tui, theme, cancelDir, "root", {
+		onCancel(record) {
+			cancelAttempts++;
+			spawn.cancelSubagent(cancelDir, record);
+		},
+	});
+	check("cancel panel opens a running row", cancelPanel.open() === true);
+	renameFaults = 100;
+	try {
+		cancelPanel.handleInput("x");
+	} catch {
+		escaped = true;
+	} finally {
+		renameFaults = 0;
+	}
+	check("cancel key survives a registry rename failure", cancelAttempts === 1 && !escaped, `attempts=${cancelAttempts} escaped=${escaped}`);
+	cancelPanel.dispose();
+
 	// --- transcript: child session renders like the main agent ---
 	const { buildTranscript } = await jiti.import(path.join(HERE, "transcript.ts"));
 	const sessFile = path.join(sandbox, "child.jsonl");
