@@ -558,24 +558,47 @@ export function cancelSubagent(agentDir: string, record: AgentRecord): AgentReco
 	const cancelOne = (item: AgentRecord): AgentRecord => {
 		let updated!: AgentRecord;
 		let pid: number | undefined;
+		let startTime: string | undefined;
 		let owned: OwnedChild | undefined;
-		withRecordLock(agentDir, item.runId, () => {
-			const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
-			const now = new Date().toISOString();
-			updated = saveRecord(agentDir, {
-				...latest,
+		const armStop = () => {
+			owned = owned ?? ownedChildren.get(item.runId);
+			runAbortControllers.get(item.runId)?.abort();
+			liveChildren.get(item.runId)?.abort();
+		};
+		try {
+			withRecordLock(agentDir, item.runId, () => {
+				const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
+				pid = latest.pid;
+				startTime = latest.pidStartTime;
+				const now = new Date().toISOString();
+				updated = saveRecord(agentDir, {
+					...latest,
+					status: "cancelled",
+					activity: "cancelled",
+					currentTool: undefined,
+					error: latest.error ?? "Cancelled",
+					finishedAt: latest.finishedAt ?? now,
+					updatedAt: now,
+				});
+				pid = updated.pid ?? pid;
+				startTime = updated.pidStartTime ?? startTime;
+				armStop();
+			});
+		} catch (error) {
+			// The marker is written before the JSON rename. A sharing violation must not
+			// leave the panel showing cancelled while the child keeps running.
+			if (!isRecordCancelled(agentDir, item.runId)) throw error;
+			armStop();
+			updated = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? {
+				...item,
 				status: "cancelled",
 				activity: "cancelled",
 				currentTool: undefined,
-				error: latest.error ?? "Cancelled",
-				finishedAt: latest.finishedAt ?? now,
-				updatedAt: now,
-			});
-			owned = ownedChildren.get(item.runId);
-			pid = updated.pid;
-			runAbortControllers.get(item.runId)?.abort();
-			liveChildren.get(item.runId)?.abort();
-		});
+				error: item.error ?? "Cancelled",
+			};
+			pid = pid ?? updated.pid;
+			startTime = startTime ?? updated.pidStartTime;
+		}
 		if (owned) {
 			const termination = owned.terminate();
 			void termination.catch(() => {
@@ -583,8 +606,8 @@ export function cancelSubagent(agentDir: string, record: AgentRecord): AgentReco
 			});
 		} else if (pid && isProcessAlive(pid)) {
 			const runId = updated.runId;
-			const startTime = updated.pidStartTime;
-			const kill = killPidTree(pid, startTime).catch((error: unknown) => {
+			const killStartTime = startTime ?? updated.pidStartTime;
+			const kill = killPidTree(pid, killStartTime).catch((error: unknown) => {
 				const message = error instanceof Error ? error.message : String(error);
 				try {
 					withRecordLock(agentDir, runId, () => {

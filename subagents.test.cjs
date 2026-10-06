@@ -10,8 +10,14 @@ const path = require("node:path");
 let failMarkerWritesFor;
 let injectedMarkerFailures = 0;
 let renameFaults = 0;
+let failJsonRenames = false;
 const realRenameSync = fs.renameSync;
 fs.renameSync = (from, to) => {
+	if (failJsonRenames && String(to).endsWith(".json")) {
+		const error = new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`);
+		error.code = "EPERM";
+		throw error;
+	}
 	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && /\.(resultsDelivered|resultsPreviewed)$/.test(String(to))) {
 		injectedMarkerFailures++;
 		throw new Error("injected marker write failure");
@@ -1564,6 +1570,28 @@ function check(name, cond, extra) {
 	const closedSlow = registry.readRecords(spawnAgentDir).find((r) => r.runId === slowRec.runId);
 	check("owned cancellation waits for child exit", !registry.isProcessAlive(slowRec.pid), String(slowRec.pid));
 	check("child close persists PID clearing", closedSlow?.pid === undefined, String(closedSlow?.pid));
+
+	const jsonLockedRec = await spawn.startSubagent({ task: "slow", name: "rename-locked" }, { ...baseCtx() });
+	failJsonRenames = true;
+	let renameCancelThrew = false;
+	try {
+		spawn.cancelSubagent(spawnAgentDir, jsonLockedRec);
+	} catch {
+		renameCancelThrew = true;
+	} finally {
+		failJsonRenames = false;
+	}
+	let jsonLockedAlive = registry.isProcessAlive(jsonLockedRec.pid);
+	for (let i = 0; i < 40 && jsonLockedAlive; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		jsonLockedAlive = registry.isProcessAlive(jsonLockedRec.pid);
+	}
+	const jsonLockedRow = registry.readRecords(spawnAgentDir).find((r) => r.runId === jsonLockedRec.runId);
+	check(
+		"cancel still kills the child when the record rename fails after the marker is written",
+		!renameCancelThrew && registry.isRecordCancelled(spawnAgentDir, jsonLockedRec.runId) && !jsonLockedAlive && jsonLockedRow?.status === "cancelled",
+		`threw=${renameCancelThrew} marker=${registry.isRecordCancelled(spawnAgentDir, jsonLockedRec.runId)} alive=${jsonLockedAlive} status=${jsonLockedRow?.status} pid=${jsonLockedRec.pid}`,
+	);
 
 	if (process.platform === "win32") {
 		const pidProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
