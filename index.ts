@@ -4,6 +4,7 @@ import {
 	getAgentDir,
 	getMarkdownTheme,
 	type ExtensionAPI,
+	type ExtensionContext,
 	type ExtensionUIContext,
 	type KeybindingsManager,
 	type SessionEntry,
@@ -19,6 +20,8 @@ import {
 	cancelSubagent,
 	killPidTree,
 	sendSubagentMessage,
+	resumeSubagent,
+	type SpawnContext,
 	settleExternalKills,
 	startSubagent,
 	terminateOwnedSubagents,
@@ -102,6 +105,7 @@ function shortId(runId: string): string {
 
 export default function subagentsExtension(pi: ExtensionAPI) {
 	let runtime: RuntimeState | undefined;
+	let sessionContext: ExtensionContext | undefined;
 	let panel: SubagentPanel | undefined;
 	let mainModel: string | undefined;
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -312,6 +316,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		sessionContext = ctx;
 		shuttingDown = false;
 		agentActive = false;
 		isIdle = () => ctx.isIdle?.() ?? !agentActive;
@@ -351,8 +356,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (!record || record.parentRunId !== owner.runId || record.rootRunId !== owner.rootRunId) {
 				throw new Error("Subagent is not owned by this session");
 			}
-			if (record.status === "cancelled") throw new Error(`${record.name} was cancelled`);
-			if (!await sendSubagentMessage(record, text, signal)) throw new Error(`${record.name} is no longer running`);
+			await sendToRecord(record, text, signal);
 		});
 
 		if (ctx.mode !== "tui") return;
@@ -401,6 +405,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return new Markdown(text, 1, 0, getMarkdownTheme());
 	});
 
+	const spawnContext = (ctx: ExtensionContext, signal?: AbortSignal): SpawnContext => {
+		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		return {
+			agentDir: getAgentDir(), parentRunId: runtime.runId, rootRunId: runtime.rootRunId,
+			currentDepth: runtime.depth, settings: runtime.settings,
+			parentModel: modelLabel(ctx), parentThinking: ctx.thinkingLevel ?? "off",
+			parentTools: pi.getActiveTools(),
+			scopedModels: ctx.scopedModels.map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
+			parentCwd: ctx.cwd, projectTrusted: runtime.projectTrusted,
+			persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc", signal,
+			onRecord: trackChild, onSettled: trackChild,
+			onUiRequest: async (child, request) => {
+				const title = `[${child.name}] ${request.title || "Subagent request"}`;
+				const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
+				switch (request.method) {
+					case "select": {
+						const value = await ctx.ui.select(title, request.options ?? [], opts);
+						return value === undefined ? { cancelled: true } : { value };
+					}
+					case "confirm": return { confirmed: await ctx.ui.confirm(title, request.message ?? "", opts) };
+					case "input": {
+						const value = await ctx.ui.input(title, request.placeholder, opts);
+						return value === undefined ? { cancelled: true } : { value };
+					}
+					case "editor": {
+						const value = await ctx.ui.editor(title, request.prefill);
+						return value === undefined ? { cancelled: true } : { value };
+					}
+					case "notify": ctx.ui.notify(`[${child.name}] ${request.message ?? ""}`, request.notifyType);
+				}
+			},
+		};
+	};
+
 	const trackChild = (record: AgentRecord) => {
 		if (shuttingDown) return;
 		refreshKeepAlive();
@@ -415,13 +453,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal): Promise<void> => {
-		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		if (!runtime || !sessionContext || shuttingDown) throw new Error("Subagent extension settings failed to initialize");
+		if (!text.trim()) throw new Error("Subagent message must not be blank");
 		signal = signal ? AbortSignal.any([signal, sessionAbort.signal]) : sessionAbort.signal;
 		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
 		if (latest.status === "cancelled") throw new Error(`${latest.name} was cancelled`);
 		if (await sendSubagentMessage(latest, text, signal)) return;
-		if (isTerminalStatus(latest.status) && (!latest.pid || !isProcessAlive(latest.pid))) {
-			throw new Error(`${latest.name} is no longer running`);
+		if (latest.parentRunId === runtime.runId) {
+			await resumeSubagent(latest, text, spawnContext(sessionContext, signal));
+			return;
 		}
 		await requestOwnerMessage(getAgentDir(), latest.parentRunId, {
 			targetRunId: latest.runId,
@@ -448,11 +488,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", (_event, ctx) => {
+		sessionContext = ctx;
 		panel?.setMainModel(modelLabel(ctx));
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true;
+		sessionContext = undefined;
 		panel?.dispose();
 		panel = undefined;
 		if (ctx.mode === "tui") {
@@ -476,7 +518,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const consumerStopped = stopOwnerConsumer?.();
 		stopOwnerConsumer = undefined;
 		// This pi process is going away: stop every live descendant. Completed
-		// RPC children stay resumable only for the lifetime of their parent session.
+		// RPC processes are stopped here; saved sessions can be resumed after reload.
 		if (!runtime) return;
 		const agentDir = getAgentDir();
 		const records = descendantsOf(readRecords(agentDir), runtime.runId);
@@ -522,7 +564,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		parameters: SpawnAgentSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
-			const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			sessionContext = ctx;
 			const record = await startSubagent(
 				{
 					task: params.task,
@@ -532,45 +574,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					thinking: params.thinking,
 					tools: params.tools,
 				},
-				{
-					agentDir: getAgentDir(),
-					parentRunId: runtime.runId,
-					rootRunId: runtime.rootRunId,
-					currentDepth: runtime.depth,
-					settings: runtime.settings,
-					parentModel,
-					parentThinking: ctx.thinkingLevel ?? "off",
-					parentTools: pi.getActiveTools(),
-					scopedModels: ctx.scopedModels.map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
-					parentCwd: ctx.cwd,
-					projectTrusted: runtime.projectTrusted,
-					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
-					signal,
-					onRecord: trackChild,
-					onUiRequest: async (child, request) => {
-						const title = `[${child.name}] ${request.title || "Subagent request"}`;
-						const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
-						switch (request.method) {
-							case "select": {
-								const value = await ctx.ui.select(title, request.options ?? [], opts);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "confirm":
-								return { confirmed: await ctx.ui.confirm(title, request.message ?? "", opts) };
-							case "input": {
-								const value = await ctx.ui.input(title, request.placeholder, opts);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "editor": {
-								const value = await ctx.ui.editor(title, request.prefill);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "notify":
-								ctx.ui.notify(`[${child.name}] ${request.message ?? ""}`, request.notifyType);
-						}
-					},
-					onSettled: trackChild,
-				},
+				spawnContext(ctx, signal),
 			);
 			return {
 				content: [
@@ -709,10 +713,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "send_to_subagent",
 		label: "Send to Subagent",
-		description: "Send a course correction or follow-up to a live subagent by run id, session id, or exact name.",
-		promptSnippet: "Steer or follow up with a live background subagent",
+		description: "Steer a running subagent or resume an owned completed session by run id, session id, or exact name.",
+		promptSnippet: "Steer a background subagent or continue its saved session",
 		parameters: SendSchema,
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			sessionContext = ctx;
 			const record = resolveRecord(params.target);
 			await sendToRecord(record, params.message, signal);
 			return {

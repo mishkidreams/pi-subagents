@@ -24,6 +24,8 @@ export interface AgentRecord {
 	rootRunId: string;
 	sessionId: string;
 	sessionFile?: string;
+	/** Distinguishes a resumed process from stale writers of the same run. */
+	processInstanceId?: string;
 	pid?: number;
 	/** Start token used to reject stale PID reuse. Linux /proc ticks, or Windows creation time in Unix milliseconds. */
 	pidStartTime?: string;

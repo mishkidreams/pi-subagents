@@ -474,6 +474,7 @@ function check(name, cond, extra) {
 		registerCommand: () => {},
 		registerTool: (tool) => checkTools.set(tool.name, tool),
 		getFlag: () => undefined,
+		getActiveTools: () => [],
 		sendMessage: () => {},
 		sendUserMessage: () => {},
 	};
@@ -486,13 +487,15 @@ function check(name, cond, extra) {
 			mode: "rpc",
 			hasUI: false,
 		});
-		const prefixRecord = mk("abcd1234-aaaa-4000-8000-000000000004", "check-parent", { rootRunId: "check-parent", status: "completed" });
+		const prefixRecord = mk("abcd1234-aaaa-4000-8000-000000000004", "check-parent", { rootRunId: "check-parent", status: "completed", tools: [] });
 		registry.saveRecord(checkAgentDir, prefixRecord);
 		const prefixCancel = await checkTools.get("cancel_subagent").execute("cancel-prefix", { target: "abcd1234" }, undefined, undefined, {});
 		check("cancel tool accepts displayed run prefix", prefixCancel.details.record.runId === prefixRecord.runId);
 		let prefixSendError;
-		try { await checkTools.get("send_to_subagent").execute("send-prefix", { target: "abcd1234", message: "hello" }); } catch (error) { prefixSendError = error; }
-		check("send tool resolves prefix before checking liveness", prefixSendError?.message.includes("is no longer running"), prefixSendError?.message);
+		try {
+			await checkTools.get("send_to_subagent").execute("send-prefix", { target: "abcd1234", message: "hello" }, undefined, undefined, { cwd: sandbox, mode: "rpc", scopedModels: [] });
+		} catch (error) { prefixSendError = error; }
+		check("send tool resolves prefix before checking saved history", prefixSendError?.message === `${prefixRecord.name} has no saved session to resume`, prefixSendError?.message);
 		const checkTool = checkTools.get("check_subagents");
 		const checkRecord = (runId, status, extra = {}) => mk(runId, "check-parent", { rootRunId: "check-parent", status, ...extra });
 		registry.saveRecord(checkAgentDir, checkRecord("first", "completed", { latestText: "first result" }));

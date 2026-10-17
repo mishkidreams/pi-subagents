@@ -2,14 +2,18 @@ import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:c
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_SETTINGS, validateRpcMaxLineChars, validateThinkingLevel } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
 import {
 	clearRecordPid,
+	claimRecordForResume,
+	StaleSubagentProcessError,
 	descendantsOf,
 	isProcessAlive,
+	isRecordedProcessAlive,
 	isRecordCancelled,
 	isTerminalStatus,
 	isTransientFsError,
@@ -711,6 +715,79 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	Object.assign(record, saveRecord(context.agentDir, record));
 	context.onRecord?.(record);
 
+	void launchRun(input, context, record).catch(() => {});
+	return record;
+}
+
+const resumingChildren = new Map<string, Promise<void>>();
+
+function waitForResume(pending: Promise<void>, signal?: AbortSignal): Promise<void> {
+	if (!signal) return pending;
+	return new Promise((resolveWait, reject) => {
+		const abort = () => reject(new Error("Subagent message was aborted"));
+		if (signal.aborted) { abort(); return; }
+		signal.addEventListener("abort", abort, { once: true });
+		pending.then(resolveWait, reject).finally(() => signal.removeEventListener("abort", abort));
+	});
+}
+
+/** Relaunch only an owned, exited child, opening the exact saved history. */
+export async function resumeSubagent(record: AgentRecord, message: string, context: SpawnContext): Promise<void> {
+	const pending = resumingChildren.get(record.runId);
+	if (pending) {
+		await waitForResume(pending, context.signal);
+		if (await sendSubagentMessage(record, message, context.signal)) return;
+		const latest = readRecords(context.agentDir).find((item) => item.runId === record.runId);
+		if (!latest) throw new Error("Subagent record disappeared");
+		return resumeSubagent(latest, message, context);
+	}
+	const resume = async () => {
+		if (context.signal?.aborted) throw new Error("Subagent message was aborted");
+		if (!message.trim()) throw new Error("Subagent message must not be blank");
+		if (record.parentRunId !== context.parentRunId || record.rootRunId !== context.rootRunId) throw new Error("Subagent is not owned by this session");
+		if (record.pid && record.pidStartTime && process.platform === "win32") {
+			await probeWindowsStartTime(record.pid);
+			record = readRecords(context.agentDir).find((item) => item.runId === record.runId) ?? record;
+		}
+		if (record.status === "cancelled") throw new Error(`${record.name} was cancelled`);
+		if (!isTerminalStatus(record.status) || isRecordedProcessAlive(record)) throw new Error(`${record.name} is still running`);
+		const maxDepth = Math.min(record.maxDepth, context.settings.maxDepth);
+		if (record.depth > maxDepth) throw new Error(`Subagent depth limit reached (${record.depth}/${maxDepth})`);
+		resolveChildModel(record.model, context.scopedModels);
+		resolveChildThinking(record.thinking, record.model, context.scopedModels, "off");
+		if (!record.tools) throw new Error("Subagent has no saved tool allowlist; cannot safely resume");
+		resolveChildTools(record.tools, context.parentTools);
+		if (!record.sessionFile) throw new Error(`${record.name} has no saved session to resume`);
+		// Read only the bounded header, asynchronously; never parse/rewrite the full transcript here.
+		const file = await open(record.sessionFile, "r");
+		try {
+			const buffer = Buffer.alloc(64 * 1024);
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+			const text = buffer.subarray(0, bytesRead).toString("utf8");
+			const end = text.indexOf("\n");
+			if (end < 0) throw new Error("Saved subagent session has no valid header");
+			const header = JSON.parse(text.slice(0, end));
+			if (header.type !== "session" || header.id !== record.sessionId || typeof header.cwd !== "string" || ensureDirectory(header.cwd) !== ensureDirectory(record.cwd)) {
+				throw new Error("Saved subagent session identity or working directory does not match");
+			}
+		} finally { await file.close(); }
+		if (context.signal?.aborted) throw new Error("Subagent message was aborted");
+		const next = claimRecordForResume(context.agentDir, record);
+		next.maxDepth = maxDepth;
+		context.onRecord?.(next);
+		await launchRun({ task: message }, { ...context, settings: { ...context.settings, maxDepth } }, next, record.sessionFile);
+	};
+	const started = resume();
+	resumingChildren.set(record.runId, started);
+	try { await started; }
+	finally { if (resumingChildren.get(record.runId) === started) resumingChildren.delete(record.runId); }
+}
+
+/** Track the process lifetime separately from the acknowledgement returned to a sender. */
+function launchRun(input: SpawnAgentInput, context: SpawnContext, record: AgentRecord, sessionFile?: string): Promise<void> {
+	let accept!: () => void;
+	let reject!: (error: unknown) => void;
+	const accepted = new Promise<void>((resolve, fail) => { accept = resolve; reject = fail; });
 	startingChildren.set(record.runId, { messages: [] });
 	const runAbort = new AbortController();
 	runAbortControllers.set(record.runId, runAbort);
@@ -719,32 +796,20 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		if (context.signal.aborted) runAbort.abort();
 		else context.signal.addEventListener("abort", abortRun, { once: true });
 	}
-	const run = runSubagentProcess(input, context, record, runAbort.signal)
-		.catch((error) => {
-			if (isRecordCancelled(context.agentDir, record.runId)) {
-				const onDisk = readRecords(context.agentDir).find((candidate) => candidate.runId === record.runId);
-				if (onDisk) Object.assign(record, onDisk);
-				return;
-			}
-			if (isTerminalStatus(record.status)) return;
-			record.status = "failed";
-			record.activity = "failed";
-			record.error = error instanceof Error ? error.message : String(error);
-			record.finishedAt = record.finishedAt ?? new Date().toISOString();
-			record.updatedAt = record.finishedAt;
-			Object.assign(record, saveRecord(context.agentDir, record));
-			context.onRecord?.(record);
-			context.onSettled?.(record);
-		})
+	const run = runSubagentProcess(input, context, record, runAbort.signal, accept, sessionFile)
+		.catch((error) => { reject(error); })
 		.finally(() => {
-			if (runAbortControllers.get(record.runId) === runAbort) runAbortControllers.delete(record.runId);
-			startingChildren.delete(record.runId);
+			reject(new Error("Subagent stopped before accepting the message"));
+			if (runAbortControllers.get(record.runId) === runAbort) {
+				runAbortControllers.delete(record.runId);
+				startingChildren.delete(record.runId);
+			}
 		});
 	childRuns.set(record.runId, run);
 	void run.finally(() => {
 		if (childRuns.get(record.runId) === run) childRuns.delete(record.runId);
 	});
-	return record;
+	return accepted;
 }
 
 async function runSubagentProcess(
@@ -752,6 +817,8 @@ async function runSubagentProcess(
 	context: SpawnContext,
 	record: AgentRecord,
 	runSignal: AbortSignal,
+	onAccepted: () => void,
+	sessionFile?: string,
 ): Promise<void> {
 	let release: (() => void) | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -778,7 +845,7 @@ async function runSubagentProcess(
 		retryTimer.unref?.();
 	};
 	const noteRegistryWriteError = (error: unknown) => {
-		if (registryWriteErrorLogged) return;
+		if (error instanceof StaleSubagentProcessError || registryWriteErrorLogged) return;
 		registryWriteErrorLogged = true;
 		const message = error instanceof Error ? error.message : String(error);
 		process.stderr.write(`pi-subagents: registry write failed for ${record.runId}: ${message}\n`);
@@ -842,8 +909,7 @@ async function runSubagentProcess(
 		const args = [
 			"--mode",
 			"rpc",
-			"--session-id",
-			record.runId,
+			...(sessionFile ? ["--session", sessionFile] : ["--session-id", record.runId]),
 			"--name",
 			record.name,
 			"--model",
@@ -1165,7 +1231,7 @@ async function runSubagentProcess(
 		launchedChild.on("close", (code) => {
 			closing = true;
 			lifetime.abort();
-			liveChildren.delete(record.runId);
+			if (liveChildren.get(record.runId) === liveChild) liveChildren.delete(record.runId);
 			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
 			consumeStdout(stdoutDecoder.end());
 			stderr = `${stderr}${stderrDecoder.end()}`.slice(-STDERR_LIMIT);
@@ -1229,10 +1295,12 @@ async function runSubagentProcess(
 			} else {
 				record.sessionFile = await findSessionFile(record.cwd, record.runId);
 			}
-			await send({ type: "prompt", message: input.task }, { signal: runSignal, deadline: startupDeadline });
+			if (runSignal.aborted) throw new Error("Subagent message was aborted");
+			await send({ type: "prompt", message: input.task }, { signal: sessionFile ? lifetime.signal : runSignal, deadline: startupDeadline });
 			const startup = startingChildren.get(record.runId);
 			liveChildren.set(record.runId, liveChild);
 			startingChildren.delete(record.runId);
+			onAccepted();
 			for (const message of startup?.messages ?? []) {
 				void liveChild.sendMessage(message).catch(() => {});
 			}
@@ -1243,6 +1311,12 @@ async function runSubagentProcess(
 			if (owned) void owned.terminate().catch(() => {});
 			throw error;
 		}
+	} catch (error) {
+		// Use the same nonblocking persistence/retry path even for admission/startup failures.
+		if (!(error instanceof StaleSubagentProcessError) && !isTerminalStatus(record.status)) {
+			settle("failed", error instanceof Error ? error.message : String(error));
+		}
+		throw error;
 	} finally {
 		if (flushTimer) {
 			clearTimeout(flushTimer);

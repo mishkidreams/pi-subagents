@@ -119,6 +119,10 @@ Steer a running child or continue its completed session by exact name, run ID, u
 send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh path." })
 ```
 
+A completed or failed **direct child** can also be resumed after its process exited or the parent reloaded. This opens its exact saved session file and sends only the new message, retaining the child/run identity and history. Missing/mismatched history is an error, not a new empty conversation. Current model scope, tool permissions, trust and depth limits still apply; a removed capability is reported instead of silently restored. Cancelled children are not restarted. A deeper descendant must still have a live creating session to admit its request; ancestors do not silently adopt it.
+
+New process instances have separate close markers and reject stale registry writes, so an old process cannot clear the resumed PID. Duplicate sends during startup share one process; each distinct message is still delivered. Send success means RPC acceptance (or retention for an already queued startup), not completion of the model turn.
+
 ### `cancel_subagent`
 
 Stop a child by exact name, run ID, or session ID:
@@ -188,12 +192,15 @@ The extension is plain TypeScript loaded directly by Pi. The regression suite us
 
 ```sh
 node subagents.test.cjs
+node continuation.test.cjs
 node panel-view.test.cjs
 node panel-refresh.test.cjs
 node panel-performance.test.cjs
 ```
 
 `panel-view.test.cjs` uses the installed Pi's real in-memory fullscreen renderer and native mouse/key dispatch, with synthetic sessions and no real agents, API calls, OS terminal or clipboard. Set `PI_ROOT` to the installed Pi package when needed. It checks coverage, pinned controls, scrolling, append/follow behavior, resizing, drafts, send failures and safe return. The fullscreen UI was tested against Pi 1.3.0 on Windows; this is not a claim of display virtualization or physical-terminal validation.
+
+`continuation.test.cjs` exercises the actual extension tool and RPC lifecycle with an offline Node fixture. It covers exited-session resume, repeated/concurrent messages, stale writers/close markers, concurrency admission/abort/retry, RPC rejection and capability/history boundaries. Process identity probes are stubbed; only owned fixtures may launch or be terminated. This is not a provider-backed live acceptance test.
 
 Source files are organized by responsibility:
 

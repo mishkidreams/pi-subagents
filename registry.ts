@@ -1,4 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -149,11 +150,15 @@ export function markRecordResultState(agentDir: string, record: AgentRecord, fla
 	atomicWrite(resultStatePath(agentDir, record, flag), "true\n");
 }
 
+function closedPath(agentDir: string, record: AgentRecord): string {
+	return markerPath(agentDir, record.processInstanceId ? `${record.runId}.${record.processInstanceId}` : record.runId, "closed");
+}
+
 function readMarkers(agentDir: string, record: AgentRecord): RecordMarkers {
 	return {
 		flags: RESULT_STATE_FLAGS.filter((flag) => existsSync(resultStatePath(agentDir, record, flag))),
 		cancellation: readCancellationMarker(agentDir, record.runId),
-		closed: existsSync(markerPath(agentDir, record.runId, "closed")),
+		closed: existsSync(closedPath(agentDir, record)),
 	};
 }
 
@@ -184,20 +189,48 @@ function applyMarkers(record: AgentRecord, { flags, cancellation, closed }: Reco
  * separate monotonic facts, so a stale writer in another process cannot undo
  * these facts by replacing the JSON record later (within the same execution).
  */
+export class StaleSubagentProcessError extends Error {
+	constructor() { super("Subagent process has been replaced by a resumed process"); }
+}
+
 export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
-	const dir = registryDir(agentDir);
-	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	if (record.status === "cancelled") writeCancellationMarker(agentDir, record);
-	const saved = applyMarkers(record, readMarkers(agentDir, record));
-	atomicWrite(recordPath(agentDir, record.runId), `${JSON.stringify(saved)}\n`);
-	return saved;
+	return withRecordLock(agentDir, record.runId, () => {
+		const target = recordPath(agentDir, record.runId);
+		const current = existsSync(target) ? JSON.parse(readFileSync(target, "utf8")) as AgentRecord : undefined;
+		if (current?.processInstanceId && current.processInstanceId !== record.processInstanceId) {
+			throw new StaleSubagentProcessError();
+		}
+		if (record.status === "cancelled") writeCancellationMarker(agentDir, record);
+		const saved = applyMarkers(record, readMarkers(agentDir, record));
+		atomicWrite(target, `${JSON.stringify(saved)}\n`);
+		return saved;
+	}, 0);
+}
+
+/** Reserve one new process, retaining run/session identity and permanent cancellation. */
+export function claimRecordForResume(agentDir: string, record: AgentRecord): AgentRecord {
+	return withRecordLock(agentDir, record.runId, () => {
+		const current = readRecords(agentDir).find((item) => item.runId === record.runId);
+		if (!current || current.processInstanceId !== record.processInstanceId) throw new StaleSubagentProcessError();
+		if (current.status === "cancelled" || isRecordCancelled(agentDir, record.runId)) throw new Error(`${record.name} was cancelled`);
+		if (!isTerminalStatus(current.status) || isRecordedProcessAlive(current)) throw new Error(`${record.name} is still running`);
+		const next: AgentRecord = {
+			...current, processInstanceId: randomUUID(), executionId: randomUUID(),
+			pid: undefined, pidStartTime: undefined, status: "queued", activity: "waiting for a concurrency slot",
+			latestText: undefined, error: undefined, finishedAt: undefined,
+			resultsDelivered: false, resultsPreviewed: false, footerDismissed: false,
+			updatedAt: new Date().toISOString(),
+		};
+		atomicWrite(recordPath(agentDir, next.runId), `${JSON.stringify(next)}\n`);
+		return next;
+	}, 0);
 }
 
 /** Mark a child PID as permanently cleared before writing its final record. */
 export function clearRecordPid(agentDir: string, record: AgentRecord): AgentRecord {
 	const dir = registryDir(agentDir);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const target = markerPath(agentDir, record.runId, "closed");
+	const target = closedPath(agentDir, record);
 	if (!existsSync(target)) atomicWrite(target, `${new Date().toISOString()}\n`);
 	return saveRecord(agentDir, { ...record, pid: undefined, pidStartTime: undefined });
 }
@@ -210,13 +243,16 @@ function randomToken(): string {
 	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-/** Serialize the launch/cancel decision for one run across Pi processes. */
-export function withRecordLock<T>(agentDir: string, runId: string, operation: () => T): T {
+const heldRecordLocks = new Set<string>();
+
+/** Serialize synchronous record operations; nested calls share this process\'s lock. */
+export function withRecordLock<T>(agentDir: string, runId: string, operation: () => T, waitMs = LOCK_WAIT_MS): T {
 	const dir = registryDir(agentDir);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const lock = join(dir, `${safeRunId(runId)}.lock`);
+	if (heldRecordLocks.has(lock)) return operation();
 	const token = `${process.pid}-${randomToken()}`;
-	const deadline = Date.now() + LOCK_WAIT_MS;
+	const deadline = Date.now() + waitMs;
 	while (true) {
 		try {
 			mkdirSync(lock, { mode: 0o700 });
@@ -250,13 +286,15 @@ export function withRecordLock<T>(agentDir: string, runId: string, operation: ()
 				}
 				continue;
 			}
-			if (Date.now() >= deadline) throw new Error(`Timed out waiting for subagent record lock: ${runId}`);
+			if (Date.now() >= deadline) throw Object.assign(new Error(`Subagent record is busy; retry: ${runId}`), { code: "EBUSY" });
 			sleepSync(5);
 		}
 	}
+	heldRecordLocks.add(lock);
 	try {
 		return operation();
 	} finally {
+		heldRecordLocks.delete(lock);
 		try {
 			if (readFileSync(join(lock, "owner"), "utf8").trim() === token) {
 				rmSync(lock, { recursive: true, force: true });
@@ -473,7 +511,7 @@ export function readProcessIdentity(pid: number, options?: { refresh?: boolean }
  * time was recorded, still refers to the same process. Without the start-time
  * check a recycled PID would keep a dead run looking active forever.
  */
-function isRecordedProcessAlive(record: AgentRecord): boolean {
+export function isRecordedProcessAlive(record: AgentRecord): boolean {
 	if (!record.pid || !isProcessAlive(record.pid)) {
 		if (record.pid !== undefined && Number.isInteger(record.pid) && record.pid >= 1) forgetWindowsProcess(record.pid);
 		return false;
@@ -544,7 +582,7 @@ export async function readRecordsAsync(agentDir: string): Promise<AgentRecord[]>
 				const marked = applyMarkers(value, {
 					flags: RESULT_STATE_FLAGS.filter((flag) => paths.has(resultStatePath(agentDir, value, flag))),
 					cancellation,
-					closed: paths.has(markerPath(agentDir, value.runId, "closed")),
+					closed: paths.has(closedPath(agentDir, value)),
 				});
 				const alive = TERMINAL.has(marked.status) || !marked.pid || await isRecordedProcessAliveAsync(marked);
 				records[index] = alive ? marked : exitedRecord(marked);
