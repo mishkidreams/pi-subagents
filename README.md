@@ -21,6 +21,8 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 
 ## Install
 
+**Fork-only viewer:** the fullscreen transcript UI described here is on [`mishkidreams/pi-subagents`, `main`](https://github.com/mishkidreams/pi-subagents/tree/main). Use that fork's checkout to keep it; the inherited npm/upstream installation commands below do not include these changes. This UI was tested with official Pi **1.3.0** on Windows, without a Pi/core build; compatibility of the new viewer with older Pi versions has not been revalidated.
+
 Install from npm with Pi:
 
 ```sh
@@ -173,10 +175,11 @@ main · openai-codex/gpt-5.5
 
 - Press **Down** at the bottom edge of the editor to inspect subagents.
 - Press **Up/Down** to select; **Enter/Right** to open a child transcript; **x** stops a running child.
-- In a transcript, type a message and press **Enter** to steer or continue the child.
-- Transcripts open in a focused overlay: **Up/Down**, **PageUp/PageDown**, and mouse-wheel scrolling affect only the child transcript, not the main conversation.
-- In a transcript, **Esc** or **Left** on an empty input returns.
-- Press **Left** to go back; **Esc** is also supported.
+- Transcripts use a **fullscreen, frameless focused overlay**. It covers the parent conversation, with the actual child's identity/status pinned above, a message field and controls below, and a persistent scrollbar. UI labels are English.
+- **Up/Down**, **PageUp/PageDown**, the mouse wheel and dragging/clicking the scrollbar affect only the child history. Page size follows the available transcript height.
+- Click **Start** to read from the beginning or **Latest** to resume following new messages. Reading older history does not jump when more lines are appended. **Ctrl+Home/End** are optional shortcuts; plain **Home/End** still edit the message field.
+- Type a message and press **Enter** to steer or continue the child. A pending send cannot be duplicated by repeated Enter. Failed sends retain the draft for retry, and each child has its own in-memory draft/editor state (not persisted across reload/restart).
+- **Esc**, the **Back** button, or **Left** on an empty input returns to the list; another **Esc** returns to the parent. Closing the viewer **never stops the child**. Stopping is the separate **x** action in the list.
 - Finished children remain visible until the next user turn, then leave the footer. Use `/subagents` to review full history.
 
 ## Development
@@ -185,7 +188,12 @@ The extension is plain TypeScript loaded directly by Pi. The regression suite us
 
 ```sh
 node subagents.test.cjs
+node panel-view.test.cjs
+node panel-refresh.test.cjs
+node panel-performance.test.cjs
 ```
+
+`panel-view.test.cjs` uses the installed Pi's real in-memory fullscreen renderer and native mouse/key dispatch, with synthetic sessions and no real agents, API calls, OS terminal or clipboard. Set `PI_ROOT` to the installed Pi package when needed. It checks coverage, pinned controls, scrolling, append/follow behavior, resizing, drafts, send failures and safe return. The fullscreen UI was tested against Pi 1.3.0 on Windows; this is not a claim of display virtualization or physical-terminal validation.
 
 Source files are organized by responsibility:
 
@@ -198,6 +206,7 @@ Source files are organized by responsibility:
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
 - `transcript.ts` — rendering child session files
+- `transcript-viewport.ts` — view-only history position, follow mode and scrollbar
 
 ## Publishing
 

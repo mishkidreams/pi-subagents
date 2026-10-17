@@ -17,19 +17,30 @@ import {
 } from "@earendil-works/pi-tui";
 import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords, readRecordsAsync, registryDir } from "./registry.ts";
 import { buildTranscript, discoverSessionFile } from "./transcript.ts";
+import { TranscriptViewport } from "./transcript-viewport.ts";
 import type { AgentRecord } from "./types.ts";
 
 const MAX_FOOTER_ROWS = 8;
 const MAX_TRANSCRIPT_LINES = 150;
 const SCROLL_STEP = 5;
 const SCROLL_PAGE = 20;
-const OVERLAY_MARGIN = 1;
+const OVERLAY_MARGIN = 0;
 const REGISTRY_DEBOUNCE_MS = 30;
 const REGISTRY_POLL_MS = 1000;
 
 interface SubagentPanelOptions {
 	onMessage?: (record: AgentRecord, text: string) => Promise<void>;
 	onCancel?: (record: AgentRecord) => void;
+}
+
+interface DetailState {
+	input: Input;
+	draft: string;
+	revision: number;
+	viewport: TranscriptViewport;
+	sending: boolean;
+	status?: string;
+	error?: boolean;
 }
 
 function shortPath(path: string): string {
@@ -90,10 +101,15 @@ export class SubagentPanel implements Component, Focusable {
 	private transcript: { key: string; components: Component[] } | null = null;
 	private transcriptFile?: string;
 	private lastDiscover = 0;
-	private scrollOffset = 0;
 	private detailRunId?: string;
+	private detailStates = new Map<string, DetailState>();
 	private messageInput = new Input();
-	private messageStatus?: string;
+	private detailGeometry?: {
+		width: number; bodyTop: number; bodyHeight: number; inputY: number; controlsY: number;
+		buttons: { start: number; end: number; action: "back" | "start" | "latest" }[];
+	};
+	private draggingScrollbar = false;
+	private pressedDetailButton?: "back" | "start" | "latest";
 	private detailOverlay?: SubagentDetailOverlay;
 	private overlayHandle?: OverlayHandle;
 	private timer: ReturnType<typeof setInterval>;
@@ -124,18 +140,31 @@ export class SubagentPanel implements Component, Focusable {
 			const text = value.trim();
 			const record = this.rows()[this.selected];
 			if (!text || !record || !this.options.onMessage) return;
-			this.messageInput.setValue("");
-			this.scrollOffset = 0;
-			this.messageStatus = "sending…";
+			const state = this.stateFor(record.runId);
+			if (state.sending) return;
+			state.draft = value;
+			const revision = state.revision;
+			state.sending = true;
+			state.error = false;
+			state.status = "Sending…";
+			state.viewport.scrollToEnd();
 			this.tui.requestRender();
-			void this.options.onMessage(record, text).then(
+			// Freeze the recipient. Esc/reordering/switching children never retargets a send.
+			void Promise.resolve().then(() => this.options.onMessage!(record, text)).then(
 				() => {
-					this.messageStatus = "sent";
-					this.tui.requestRender();
+					state.sending = false;
+					state.status = "Sent";
+					if (state.revision === revision) {
+						state.draft = "";
+						state.input.setValue("");
+					}
+					if (!this.disposed) this.tui.requestRender();
 				},
 				(error) => {
-					this.messageStatus = error instanceof Error ? error.message : String(error);
-					this.tui.requestRender();
+					state.sending = false;
+					state.error = true;
+					state.status = `Send failed: ${error instanceof Error ? error.message : String(error)} · Enter retry`;
+					if (!this.disposed) this.tui.requestRender();
 				},
 			);
 		};
@@ -219,11 +248,30 @@ export class SubagentPanel implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
+	private stateFor(runId: string): DetailState {
+		let state = this.detailStates.get(runId);
+		if (!state) {
+			const input = new Input();
+			input.onSubmit = this.messageInput.onSubmit;
+			state = { input, draft: "", revision: 0, viewport: new TranscriptViewport(), sending: false };
+			this.detailStates.set(runId, state);
+		}
+		return state;
+	}
+
 	private openDetail(): void {
-		if (this.rows().length === 0) return;
+		const record = this.selectedRecord();
+		if (!record) return;
 		this.detail = true;
-		this.messageStatus = undefined;
-		this.scrollOffset = 0;
+		this.messageInput.focused = false;
+		const state = this.stateFor(record.runId);
+		this.messageInput = state.input;
+		this.messageInput.setValue(state.draft);
+		if (this.detailRunId !== record.runId) {
+			this.transcript = null;
+			this.transcriptFile = undefined;
+		}
+		this.detailRunId = record.runId;
 
 		// A focused overlay is important here: Pi's fullscreen TUI otherwise
 		// consumes page keys and mouse-wheel events for the main conversation
@@ -247,9 +295,12 @@ export class SubagentPanel implements Component, Focusable {
 	}
 
 	private closeDetail(): void {
+		if (this.detailRunId) this.stateFor(this.detailRunId).draft = this.messageInput.getValue();
 		this.detail = false;
+		this.draggingScrollbar = false;
+		this.pressedDetailButton = undefined;
+		this.detailGeometry = undefined;
 		this.messageInput.focused = false;
-		this.scrollOffset = 0;
 		const handle = this.overlayHandle;
 		this.overlayHandle = undefined;
 		this.detailOverlay = undefined;
@@ -343,14 +394,14 @@ export class SubagentPanel implements Component, Focusable {
 		const rows = this.rows();
 		const restored = selectedId ? rows.findIndex((record) => record.runId === selectedId) : -1;
 		this.selected = restored >= 0 ? restored : Math.min(this.selected, Math.max(0, rows.length - 1));
+		if (this.detail && (rows.length === 0 || (selectedId && restored < 0))) this.closeDetail();
 		if (this.focused && rows.length === 0) this.close();
 	}
 
 	private scrollByWheel(delta: number): boolean {
 		if (!Number.isFinite(delta) || delta === 0) return false;
-		const previous = this.scrollOffset;
-		this.scrollOffset = Math.max(0, this.scrollOffset - Math.sign(delta) * SCROLL_STEP);
-		return this.scrollOffset !== previous;
+		const record = this.selectedRecord();
+		return record ? this.stateFor(record.runId).viewport.scrollBy(Math.sign(delta) * SCROLL_STEP) : false;
 	}
 
 	private handleWheel(data: string): boolean {
@@ -367,8 +418,44 @@ export class SubagentPanel implements Component, Focusable {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (!this.detail || event.type !== "wheel" || !event.wheelDelta) return undefined;
-		return { handled: true, render: this.scrollByWheel(event.wheelDelta) };
+		if (!this.detail) return undefined;
+		if (event.type === "wheel" && event.wheelDelta) return { handled: true, render: this.scrollByWheel(event.wheelDelta) };
+		const geometry = this.detailGeometry;
+		const record = this.selectedRecord();
+		if (!geometry || !record) return undefined;
+		const viewport = this.stateFor(record.runId).viewport;
+		const onBar = event.x === geometry.width - 1 && event.y >= geometry.bodyTop && event.y < geometry.bodyTop + geometry.bodyHeight;
+		if (this.draggingScrollbar || (onBar && event.button === "left" && event.type === "press")) {
+			if (event.type === "release") this.draggingScrollbar = false;
+			else if (event.type !== "click") this.draggingScrollbar = true;
+			viewport.scrollToFraction((event.y - geometry.bodyTop) / Math.max(1, geometry.bodyHeight - 1));
+			this.tui.requestRender();
+			return { handled: true, capture: event.type === "press" };
+		}
+		if (event.button !== "left") return undefined;
+		const pressed = this.pressedDetailButton;
+		if (event.type === "release") this.pressedDetailButton = undefined;
+		if (event.y === geometry.controlsY) {
+			const button = geometry.buttons.find(b => event.x >= b.start && event.x < b.end);
+			if (!button) return undefined;
+			if (event.type === "press") {
+				this.pressedDetailButton = button.action;
+				return { handled: true, capture: true };
+			}
+			if (event.type !== "release" || pressed !== button.action) return { handled: true };
+			if (button.action === "back") this.closeDetail();
+			else {
+				if (button.action === "start") viewport.scrollToStart(); else viewport.scrollToEnd();
+				this.tui.requestRender();
+			}
+			return { handled: true };
+		}
+		if (event.y === geometry.inputY) {
+			const result = this.messageInput.handleMouse({ ...event, y: 0 });
+			if (result) this.tui.requestRender();
+			return result;
+		}
+		return undefined;
 	}
 
 	handleInput(data: string): void {
@@ -385,22 +472,22 @@ export class SubagentPanel implements Component, Focusable {
 		}
 		if (this.detail) {
 			if (this.handleWheel(data)) return;
-			if (matchesKey(data, Key.up)) {
-				this.scrollOffset += SCROLL_STEP;
-				this.tui.requestRender();
-			} else if (matchesKey(data, Key.down)) {
-				this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_STEP);
-				this.tui.requestRender();
-			} else if (matchesKey(data, Key.pageUp)) {
-				this.scrollOffset += SCROLL_PAGE;
-				this.tui.requestRender();
-			} else if (matchesKey(data, Key.pageDown)) {
-				this.scrollOffset = Math.max(0, this.scrollOffset - SCROLL_PAGE);
-				this.tui.requestRender();
-			} else {
+			const record = this.selectedRecord();
+			if (!record) return;
+			const state = this.stateFor(record.runId);
+			const page = Math.max(1, (this.detailGeometry?.bodyHeight ?? SCROLL_PAGE) - 1);
+			if (matchesKey(data, Key.ctrl("home"))) state.viewport.scrollToStart();
+			else if (matchesKey(data, Key.ctrl("end"))) state.viewport.scrollToEnd();
+			else if (matchesKey(data, Key.up)) state.viewport.scrollBy(-SCROLL_STEP);
+			else if (matchesKey(data, Key.down)) state.viewport.scrollBy(SCROLL_STEP);
+			else if (matchesKey(data, Key.pageUp)) state.viewport.scrollBy(-page);
+			else if (matchesKey(data, Key.pageDown)) state.viewport.scrollBy(page);
+			else {
 				this.messageInput.handleInput(data);
-				this.tui.requestRender();
+				const value = this.messageInput.getValue();
+				if (state.draft !== value) { state.draft = value; state.revision++; }
 			}
+			this.tui.requestRender();
 			return;
 		}
 		// Enter or Right arrow opens the selected subagent.
@@ -547,52 +634,49 @@ export class SubagentPanel implements Component, Focusable {
 	private renderDetail(width: number, maxHeight = MAX_TRANSCRIPT_LINES + 8): string[] {
 		const record = this.rows()[this.selected];
 		if (!record) return [];
-		if (this.detailRunId !== record.runId) {
-			this.detailRunId = record.runId;
-			this.scrollOffset = 0;
-			this.transcript = null;
-			this.transcriptFile = undefined;
-		}
+		const height = Math.max(1, maxHeight);
+		const state = this.stateFor(record.runId);
+		const oneLine = (text: string) => text.replace(/[\r\n]/g, " ");
 		const icon = this.theme.fg(statusColor(record), statusIcon(record));
-		const header = [
-			truncateToWidth(`${icon} ${this.theme.bold(record.name)} ${this.theme.fg("dim", `· ${record.status} · ${elapsed(record)}`)}`, width),
-			this.theme.fg("dim", `${record.model}${record.thinking !== "off" ? `:${record.thinking}` : ""} · depth ${record.depth}/${record.maxDepth} · ${shortPath(record.cwd)}`),
-			"",
-		];
+		const title = `Subagent: ${icon} ${this.theme.bold(oneLine(record.name))} · ${record.status} · ${elapsed(record)}`;
+		const divider = this.theme.fg("dim", "─".repeat(Math.max(0, width)));
+		const header = [title];
+		if (height >= 5) header.push(""); // Filled with model/position after measuring the body viewport.
+		if (height >= 9) header.push(divider);
 		const footer = [
-			"",
-			...(this.messageStatus
-				? [this.theme.fg(this.messageStatus === "sent" || this.messageStatus === "sending…" ? "dim" : "error", this.messageStatus)]
-				: []),
-			this.theme.fg("muted", "Message this subagent:"),
-			...this.messageInput.render(width),
-			this.theme.fg("dim", "Enter send   ↑/↓/PgUp/PgDn scroll   Esc back"),
+			...(height >= 9 ? [divider] : []),
+			...(height >= 6 ? [this.theme.fg(state.error ? "error" : "muted", `${state.status ? `${oneLine(state.status)} · ` : ""}Message this subagent · Enter send`)] : []),
+			...this.messageInput.render(width).slice(0, 1),
 		];
-		const available = Math.max(1, maxHeight - header.length - footer.length);
-		const lines = [...header];
+		const textWidth = Math.max(1, width - 2);
 		const components = this.transcriptComponents(record);
-		if (!components || components.length === 0) {
-			lines.push(...this.legacyDetail(record, width).slice(0, available));
-		} else {
-			const body: string[] = [];
-			for (const component of components) {
-				for (const line of component.render(width)) body.push(clean(line));
-			}
-			if (record.activity === "responding" && record.latestText) {
-				body.push("", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText, Math.max(1, width)));
-			}
-			const bodyViewport = Math.max(1, available - 2);
-			this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, body.length - bodyViewport));
-			const end = Math.max(0, body.length - this.scrollOffset);
-			const start = Math.max(0, end - bodyViewport);
-			const content: string[] = [];
-			if (start > 0) content.push(this.theme.fg("dim", `… ${start} earlier lines · ↑/PgUp scroll`));
-			content.push(...body.slice(start, end));
-			if (this.scrollOffset > 0) content.push(this.theme.fg("dim", `… ${body.length - end} newer lines · ↓/PgDn follow`));
-			lines.push(...content.slice(0, available));
+		const body = components?.length ? components.flatMap(component => component.render(textWidth).map(clean)) : this.legacyDetail(record, textWidth);
+		if (components?.length && record.activity === "responding" && record.latestText) {
+			body.push("", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText, textWidth));
 		}
-		lines.push(...footer);
-		return lines.slice(0, maxHeight).map((line) => truncateToWidth(line, width, ""));
+		const view = state.viewport.render(body, width, Math.max(0, height - header.length - footer.length - 1), text => this.theme.fg("dim", text));
+		const labels = width >= 50 ? ["[Esc back]", "[↑ Start]", "[↓ Latest]"] : width >= 28 ? ["[Esc back]", "[Start]", "[Latest]"] : ["[Esc]", "[↑]", "[↓]"];
+		let column = 0;
+		const buttons = labels.map((label, index) => {
+			const start = column;
+			column += visibleWidth(label) + 1;
+			return { start, end: column - 1, action: (["back", "start", "latest"] as const)[index] };
+		});
+		if (height >= 5) {
+			const position = width >= 40 ? view.position : view.mode;
+			const separator = width >= 40 ? " · " : " ";
+			const modelWidth = Math.max(1, width - visibleWidth(position) - visibleWidth(separator));
+			const model = truncateToWidth(oneLine(`${record.model}${record.thinking !== "off" ? `:${record.thinking}` : ""}`), modelWidth, "…");
+			header[1] = this.theme.fg("dim", `${model}${separator}${position}${width >= 80 ? ` · #${record.runId.slice(0, 8)} · ${oneLine(shortPath(record.cwd))}` : ""}`);
+		}
+		const help = this.theme.fg("dim", `${labels.join(" ")}${width >= 40 ? " · PgUp/PgDn" : ""}`);
+		this.detailGeometry = { width, bodyTop: header.length, bodyHeight: view.lines.length, inputY: height - 2, controlsY: height - 1, buttons };
+		const lines = height < 4 ? [title, ...footer].slice(0, height - 1).concat(help) : [...header, ...view.lines, ...footer, help];
+		// Fill every cell and row: overlay transparency must never expose the parent.
+		return Array.from({ length: height }, (_, row) => {
+			const line = truncateToWidth(lines[row] ?? "", Math.max(0, width), "");
+			return line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+		});
 	}
 
 	invalidate(): void {
