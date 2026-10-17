@@ -17,6 +17,8 @@ export interface UsageSummary {
 	cost: number;
 }
 
+export type ResultRoute = "parent" | "manual";
+
 export interface AgentRecord {
 	version: 1;
 	runId: string;
@@ -40,6 +42,10 @@ export interface AgentRecord {
 	status: AgentStatus;
 	/** Fresh on each agent_start; scopes parent-owned result/UI markers to one execution. */
 	executionId?: string;
+	/** Manual conversation stays readable but never enters automatic parent delivery. Omitted means parent (legacy). */
+	resultRoute?: ResultRoute;
+	/** Monotonic visible user/assistant message count, retained across continuations. */
+	conversationRevision?: number;
 	/** Set when the user started a newer turn: hide from the footer tree. History stays reviewable. */
 	footerDismissed?: boolean;
 	/**

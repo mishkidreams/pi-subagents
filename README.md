@@ -107,9 +107,25 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 
 Automatic delivery is best-effort; a check is authoritative. A result that only appeared as a tool-output preview is still returned by the next check, while results already returned by an earlier check are not repeated. This means a check never hides a finished result just because it was delivered automatically.
 
+Manual conversations started in the transcript viewer remain visible as status rows, but their replies are not collected as delegated results and do not make a default check wait. Use `read_subagent_messages` to inspect their conversation. Explicit `wait: true` still waits for every running child.
+
 A default check never waits pointlessly. It returns immediately when every subagent is terminal or nothing new is pending. While subagents are running, it waits for the first finished result (or until they all finish) up to `timeoutMs`, so the call returns with something useful instead of an empty status. Pass `wait: false` for an immediate status snapshot, or `wait: true` to block until every subagent finishes. `timeoutMs` defaults to 30 seconds and is capped at 300 seconds.
 
 Results are also delivered automatically, so repeated checks just to poll status waste turns. Call `check_subagents` when you need results now, then continue with other work.
+
+### `read_subagent_messages`
+
+Read both user and assistant text from an owned child's saved active branch, including the original delegation across compaction:
+
+```text
+read_subagent_messages({ target: "auth-reviewer" })
+```
+
+The default returns new conversation text since the last read. The cursor is saved in the parent's session metadata, including calls nested inside codemode, so reload does not replay already-read messages. Use `fromStart: true` to start over, or an explicit `cursor` to inspect a particular page without changing the automatic read position. Branch changes may require resetting the cursor.
+
+Output defaults to 20 message chunks / 24,000 UTF-16 characters, with maxima of 100 chunks / 50,000 characters (`limit` / `maxChars`). Large messages are split without losing their suffix; continue while `details.hasMore` is true and retain `details.nextCursor` even at the end for later delta reads. Thinking, tool payloads and image bytes are excluded; images use a placeholder. Conversation text is data, not new instructions to the parent.
+
+Reading does not message or wake the child and does not collect a delegated result. Inspection validates the saved session identity, cwd and installed session version; missing, mismatched or migration-requiring histories fail without creating or migrating files.
 
 ### `send_to_subagent`
 
@@ -121,7 +137,7 @@ send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh
 
 A completed or failed **direct child** can also be resumed after its process exited or the parent reloaded. This opens its exact saved session file and sends only the new message, retaining the child/run identity and history. Missing/mismatched history is an error, not a new empty conversation. Current model scope, tool permissions, trust and depth limits still apply; a removed capability is reported instead of silently restored. Cancelled children are not restarted. A deeper descendant must still have a live creating session to admit its request; ancestors do not silently adopt it.
 
-New process instances have separate close markers and reject stale registry writes, so an old process cannot clear the resumed PID. Duplicate sends during startup share one process; each distinct message is still delivered. Send success means RPC acceptance (or retention for an already queued startup), not completion of the model turn.
+New process instances have separate close markers and reject stale registry writes, so an old process cannot clear the resumed PID. Duplicate sends during startup share one process; each distinct message is still delivered. Send success means RPC acceptance (or retention for an already queued startup), not completion of the model turn. Cancelling the sender's wait cannot erase late acceptance or its parent-directed result; accepted commands keep their ordering and concurrency accounting. The live continuation admission write retries transient Windows rename failures asynchronously, without blocking handle-close callbacks; unrelated errors and registry-writer contention still fail explicitly.
 
 ### `cancel_subagent`
 
@@ -138,6 +154,10 @@ While the parent works, finished child reports stay in the registry until a comp
 A tool-output append is a best-effort preview. It stops the same report from being appended again, but the report remains collectable by `check_subagents` until a check returns it or an idle batch delivers it. This keeps the model from losing a result that was buried in unrelated tool output while still avoiding duplicate automatic deliveries.
 
 On Pi 0.99+, the preview keeps a tool's structured content intact, so tools that declare an output schema (such as codemode or MCP tools) do not lose it. Nested calls a tool makes through `ctx.executeTool()` are skipped; only the model-visible outer tool result carries the preview.
+
+Messages sent manually from the transcript viewer are quiet: their replies stay in that child's history and do not interrupt the parent or start a parent turn. The parent can inspect both sides on request with `read_subagent_messages`; `check_subagents` shows status and a new-messages hint without copying that chat into a result report. Reading the chat and collecting delegated task results are independent.
+
+Ordinary `spawn_agent` and `send_to_subagent` work keeps the delivery behavior above. A pending delegated result survives a later manual conversation. Steering an in-flight delegation from the viewer does not suppress the result already owed to the parent; a new parent-requested turn still supersedes an older unread result, as before.
 
 This replaces the previous behavior of queueing a separate follow-up prompt for every completion. Reports no longer accumulate behind a long parent run and replay after its final answer. If a child completes several follow-ups before the parent consumes its report, only the latest execution is delivered. Earlier output remains available in the child's transcript.
 
@@ -193,6 +213,8 @@ The extension is plain TypeScript loaded directly by Pi. The regression suite us
 ```sh
 node subagents.test.cjs
 node continuation.test.cjs
+node history.test.cjs
+node routing.test.cjs
 node panel-view.test.cjs
 node panel-refresh.test.cjs
 node panel-performance.test.cjs
@@ -202,11 +224,14 @@ node panel-performance.test.cjs
 
 `continuation.test.cjs` exercises the actual extension tool and RPC lifecycle with an offline Node fixture. It covers exited-session resume, repeated/concurrent messages, stale writers/close markers, concurrency admission/abort/retry, RPC rejection and capability/history boundaries. Process identity probes are stubbed; only owned fixtures may launch or be terminated. This is not a provider-backed live acceptance test.
 
+`history.test.cjs` uses the installed Pi's real `SessionManager` against synthetic JSONL and forbids network, providers and process launches. It covers both sides, compaction, active branches, lossless pagination, delta cursors and invalid/mismatched histories. `routing.test.cjs` uses the actual extension with an offline owned RPC fixture to distinguish quiet manual chat from delegated delivery, previews, idle wakeups, saved read cursors and cross-owner routing; it does not claim physical-terminal or provider-backed acceptance.
+
 Source files are organized by responsibility:
 
 - `index.ts` — Pi registration, lifecycle hooks, tools, delivery, and UI wiring
 - `config.ts` — settings validation and precedence
-- `registry.ts` — atomic run records
+- `registry.ts` — atomic run records and the latest pending delegated result per child
+- `history.ts` — bounded read-only conversation inspection and active-branch cursors
 - `wait.ts` — event-driven wait for descendant completion (`check_subagents` wait:true)
 - `spawn-agent.ts` — RPC process control, concurrency, cancellation, and depth enforcement
 - `owner-control.ts` — cross-process requests/acknowledgements routed through the target's creating session; revoked requests abort pending admission

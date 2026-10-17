@@ -2,12 +2,14 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isProcessAlive, renameReplacing } from "./registry.ts";
+import type { ResultRoute } from "./types.ts";
 
 interface Request {
 	version: 1;
 	rootRunId: string;
 	targetRunId: string;
 	text: string;
+	resultRoute?: ResultRoute;
 	pid: number;
 }
 function removeRequest(dir: string): void {
@@ -53,7 +55,7 @@ export async function requestOwnerMessage(
  */
 export function startOwnerMessageConsumer(
 	agentDir: string, owner: string, rootRunId: string,
-	deliver: (target: string, text: string, signal: AbortSignal) => Promise<void>,
+	deliver: (target: string, text: string, signal: AbortSignal, resultRoute: ResultRoute) => Promise<void>,
 ): () => Promise<void> {
 	const base = directory(agentDir, owner);
 	const active = new Map<string, { abort: AbortController; done: Promise<void> }>();
@@ -75,7 +77,7 @@ export function startOwnerMessageConsumer(
 			let request: Request;
 			try {
 				request = JSON.parse(readFileSync(join(dir, "request.json"), "utf8"));
-				if (request.version !== 1 || request.rootRunId !== rootRunId || typeof request.targetRunId !== "string" || typeof request.text !== "string" || !request.text.trim() || !Number.isInteger(request.pid) || request.pid < 1) throw new Error("Invalid request");
+				if (request.version !== 1 || request.rootRunId !== rootRunId || typeof request.targetRunId !== "string" || typeof request.text !== "string" || !request.text.trim() || (request.resultRoute !== undefined && request.resultRoute !== "parent" && request.resultRoute !== "manual") || !Number.isInteger(request.pid) || request.pid < 1) throw new Error("Invalid request");
 			} catch {
 				removeRequest(dir);
 				continue;
@@ -95,7 +97,7 @@ export function startOwnerMessageConsumer(
 				let error: string | undefined;
 				try {
 					if (!isProcessAlive(request.pid)) throw new Error("Subagent sender exited");
-					await deliver(request.targetRunId, request.text, abort.signal);
+					await deliver(request.targetRunId, request.text, abort.signal, request.resultRoute ?? "parent");
 				} catch (cause) {
 					error = cause instanceof Error ? cause.message : String(cause);
 				}

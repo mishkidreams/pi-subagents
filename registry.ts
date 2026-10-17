@@ -12,7 +12,8 @@ import {
 } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentRecord, AgentStatus } from "./types.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import type { AgentRecord, AgentStatus, ResultRoute } from "./types.ts";
 
 const TERMINAL = new Set<AgentStatus>(["completed", "failed", "cancelled"]);
 const LOCK_STALE_MS = 30_000;
@@ -81,21 +82,22 @@ export function renameReplacing(from: string, to: string): void {
 	}
 }
 
-function atomicWrite(target: string, contents: string): void {
+function atomicWrite(target: string, contents: string, retryRename = true): void {
 	const temporary = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 	// mode is a chmod on Windows and can itself fail with EPERM. The directory is already private.
 	const options: { encoding: "utf8"; mode?: number } = { encoding: "utf8" };
 	if (process.platform !== "win32") options.mode = 0o600;
 	writeFileSync(temporary, contents, options);
 	try {
-		renameReplacing(temporary, target);
+		if (retryRename) renameReplacing(temporary, target);
+		else renameSync(temporary, target);
 	} catch (error) {
 		rmSync(temporary, { force: true });
 		throw error;
 	}
 }
 
-function writeCancellationMarker(agentDir: string, record: AgentRecord): void {
+function writeCancellationMarker(agentDir: string, record: AgentRecord, retryRename = true): void {
 	const target = markerPath(agentDir, record.runId, "cancelled");
 	if (existsSync(target)) return;
 	const marker: CancellationMarker = {
@@ -104,7 +106,7 @@ function writeCancellationMarker(agentDir: string, record: AgentRecord): void {
 		cancelledAt: record.finishedAt ?? new Date().toISOString(),
 		error: record.error,
 	};
-	atomicWrite(target, `${JSON.stringify(marker)}\n`);
+	atomicWrite(target, `${JSON.stringify(marker)}\n`, retryRename);
 }
 
 function readCancellationMarker(agentDir: string, runId: string): CancellationMarker | undefined {
@@ -140,6 +142,14 @@ function resultStatePath(agentDir: string, record: AgentRecord, flag: ResultStat
 	return join(registryDir(agentDir), `${safeRunId(record.runId)}.${safeRunId(record.executionId ?? "legacy")}.${flag}`);
 }
 
+export function resultKey(record: AgentRecord): string {
+	return JSON.stringify([record.runId, record.executionId ?? record.finishedAt ?? record.updatedAt]);
+}
+
+function resultArchivePath(agentDir: string, record: AgentRecord): string {
+	return join(agentDir, "subagents", "results", `${safeRunId(record.runId)}.json`);
+}
+
 /**
  * Parent/UI writes must never replace the execution owner's JSON snapshot.
  * Each flag is an independent monotonic fact scoped to the observed execution,
@@ -148,6 +158,16 @@ function resultStatePath(agentDir: string, record: AgentRecord, flag: ResultStat
 export function markRecordResultState(agentDir: string, record: AgentRecord, flag: ResultStateFlag): void {
 	mkdirSync(registryDir(agentDir), { recursive: true, mode: 0o700 });
 	atomicWrite(resultStatePath(agentDir, record, flag), "true\n");
+	if (flag === "resultsDelivered") {
+		// This is an outbox, not a second history. Keep ordinary tool results from
+		// rereading every old full response for the lifetime of the installation.
+		try {
+			withRecordLock(agentDir, record.runId, () => {
+				const target = resultArchivePath(agentDir, record);
+				if (existsSync(target) && resultKey(JSON.parse(readFileSync(target, "utf8"))) === resultKey(record)) rmSync(target, { force: true });
+			}, 0);
+		} catch { /* The durable marker still suppresses it; never remove a newer result. */ }
+	}
 }
 
 function closedPath(agentDir: string, record: AgentRecord): string {
@@ -183,6 +203,54 @@ function applyMarkers(record: AgentRecord, { flags, cancellation, closed }: Reco
 	return result;
 }
 
+/** Preserve a finished delegation before a manual continuation can replace its live record.
+ * Delivery markers remain execution-scoped; cancellation of a later turn must not rewrite this result.
+ */
+function archiveParentResult(agentDir: string, record: AgentRecord, retryRename = true): void {
+	if (!isTerminalStatus(record.status) || record.resultRoute === "manual" || record.resultsDelivered) return;
+	const dir = join(agentDir, "subagents", "results");
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const target = resultArchivePath(agentDir, record);
+	if (!existsSync(target) || resultKey(JSON.parse(readFileSync(target, "utf8"))) !== resultKey(record)) {
+		// One latest delegation per child, preserving the pre-existing coalescing
+		// contract. Manual turns never replace this pending parent result.
+		atomicWrite(target, `${JSON.stringify({ ...record, pid: undefined, pidStartTime: undefined })}\n`, retryRename);
+	}
+}
+
+/** Finished parent-directed executions, including those superseded by a later manual turn. */
+export function readParentResults(agentDir: string): AgentRecord[] {
+	const current = readRecords(agentDir);
+	const live = new Map(current.map((record) => [record.runId, record]));
+	const records = new Map<string, AgentRecord>();
+	const add = (record: AgentRecord) => {
+		if (!isTerminalStatus(record.status) || record.resultRoute === "manual") return;
+		// Only delivery facts apply to archived executions, never a later run-wide cancellation.
+		for (const flag of RESULT_STATE_FLAGS) {
+			if (existsSync(resultStatePath(agentDir, record, flag))) record = { ...record, [flag]: true };
+		}
+		if (!record.resultsDelivered) records.set(record.runId, record);
+	};
+	const dir = join(agentDir, "subagents", "results");
+	if (existsSync(dir)) {
+		for (const name of readdirSync(dir)) {
+			if (!name.endsWith(".json")) continue;
+			try {
+				const record = JSON.parse(readFileSync(join(dir, name), "utf8")) as AgentRecord;
+				const active = live.get(record.runId);
+				// A newer parent-requested turn supersedes the old snapshot, exactly
+				// as before. Only manual continuation preserves a previous delegation.
+				if (active && active.resultRoute !== "manual" &&
+					(!isTerminalStatus(active.status) || resultKey(active) !== resultKey(record))) continue;
+				if (record.version === 1 && typeof record.runId === "string") add(record);
+			} catch { /* A damaged historical result must not hide other results. */ }
+		}
+	}
+	// Compatibility with records written before the result archive existed.
+	for (const record of current) add(record);
+	return [...records.values()];
+}
+
 /**
  * Persist an execution-owner record atomically. Parent/UI flags must use
  * markRecordResultState instead. Result flags, cancellation and close markers are
@@ -194,28 +262,48 @@ export class StaleSubagentProcessError extends Error {
 }
 
 export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
+	return saveRecordWithRenameMode(agentDir, record, true);
+}
+
+/** Message admission can wait for a Windows open handle, but must not block its close callbacks. */
+export async function saveRecordAsync(agentDir: string, record: AgentRecord, signal?: AbortSignal): Promise<AgentRecord> {
+	const deadline = Date.now() + 2_000;
+	while (true) {
+		if (signal?.aborted) throw new Error("Subagent message was aborted");
+		try { return saveRecordWithRenameMode(agentDir, record, false); }
+		catch (error) {
+			if (!isTransientFsError(error) || (error as NodeJS.ErrnoException).syscall !== "rename" || Date.now() >= deadline) throw error;
+			await delay(25, undefined, { signal });
+		}
+	}
+}
+
+function saveRecordWithRenameMode(agentDir: string, record: AgentRecord, retryRename: boolean): AgentRecord {
 	return withRecordLock(agentDir, record.runId, () => {
 		const target = recordPath(agentDir, record.runId);
 		const current = existsSync(target) ? JSON.parse(readFileSync(target, "utf8")) as AgentRecord : undefined;
 		if (current?.processInstanceId && current.processInstanceId !== record.processInstanceId) {
 			throw new StaleSubagentProcessError();
 		}
-		if (record.status === "cancelled") writeCancellationMarker(agentDir, record);
+		if (current) archiveParentResult(agentDir, applyMarkers(current, readMarkers(agentDir, current)), retryRename);
+		if (record.status === "cancelled") writeCancellationMarker(agentDir, record, retryRename);
 		const saved = applyMarkers(record, readMarkers(agentDir, record));
-		atomicWrite(target, `${JSON.stringify(saved)}\n`);
+		atomicWrite(target, `${JSON.stringify(saved)}\n`, retryRename);
+		archiveParentResult(agentDir, saved, retryRename);
 		return saved;
 	}, 0);
 }
 
 /** Reserve one new process, retaining run/session identity and permanent cancellation. */
-export function claimRecordForResume(agentDir: string, record: AgentRecord): AgentRecord {
+export function claimRecordForResume(agentDir: string, record: AgentRecord, resultRoute: ResultRoute = "parent"): AgentRecord {
 	return withRecordLock(agentDir, record.runId, () => {
 		const current = readRecords(agentDir).find((item) => item.runId === record.runId);
 		if (!current || current.processInstanceId !== record.processInstanceId) throw new StaleSubagentProcessError();
 		if (current.status === "cancelled" || isRecordCancelled(agentDir, record.runId)) throw new Error(`${record.name} was cancelled`);
 		if (!isTerminalStatus(current.status) || isRecordedProcessAlive(current)) throw new Error(`${record.name} is still running`);
+		archiveParentResult(agentDir, current);
 		const next: AgentRecord = {
-			...current, processInstanceId: randomUUID(), executionId: randomUUID(),
+			...current, processInstanceId: randomUUID(), executionId: randomUUID(), resultRoute,
 			pid: undefined, pidStartTime: undefined, status: "queued", activity: "waiting for a concurrency slot",
 			latestText: undefined, error: undefined, finishedAt: undefined,
 			resultsDelivered: false, resultsPreviewed: false, footerDismissed: false,

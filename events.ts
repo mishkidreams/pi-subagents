@@ -100,6 +100,9 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 			important = true;
 			break;
 		case "message_end":
+			if (event.message?.role === "user" || messageText(event.message)) {
+				record.conversationRevision = (record.conversationRevision ?? 0) + 1;
+			}
 			if (event.message?.role === "assistant") {
 				const text = messageText(event.message);
 				if (text) {

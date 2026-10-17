@@ -22,9 +22,10 @@ import {
 	type ProcessIdentity,
 	readRecords,
 	saveRecord,
+	saveRecordAsync,
 	withRecordLock,
 } from "./registry.ts";
-import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
+import { EMPTY_USAGE, type AgentRecord, type ResultRoute, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
 
 const externalKills = new Set<Promise<void>>();
 
@@ -107,11 +108,11 @@ export const gate = new ConcurrencyGate();
 
 interface LiveChild {
 	abort(): void;
-	sendMessage(message: string, signal?: AbortSignal): Promise<void>;
+	sendMessage(message: string, signal?: AbortSignal, resultRoute?: ResultRoute): Promise<void>;
 }
 
 interface StartingChild {
-	messages: string[];
+	messages: Array<{ message: string; resultRoute: ResultRoute }>;
 }
 
 interface OwnedChild {
@@ -127,16 +128,16 @@ const childRuns = new Map<string, Promise<void>>();
 const runAbortControllers = new Map<string, AbortController>();
 
 /** Send directly when this process owns the target child, or queue while it starts. */
-export async function sendSubagentMessage(record: AgentRecord, message: string, signal?: AbortSignal): Promise<boolean> {
+export async function sendSubagentMessage(record: AgentRecord, message: string, signal?: AbortSignal, resultRoute: ResultRoute = "parent"): Promise<boolean> {
 	if (signal?.aborted) throw new Error("Subagent message was aborted");
 	const live = liveChildren.get(record.runId);
 	if (live) {
-		await live.sendMessage(message, signal);
+		await live.sendMessage(message, signal, resultRoute);
 		return true;
 	}
 	const startup = startingChildren.get(record.runId);
 	if (!startup) return false;
-	startup.messages.push(message);
+	startup.messages.push({ message, resultRoute });
 	return true;
 }
 
@@ -159,6 +160,7 @@ export interface SpawnContext {
 	parentCwd: string;
 	projectTrusted: boolean;
 	persistAfterSettled?: boolean;
+	resultRoute?: ResultRoute;
 	signal?: AbortSignal;
 	onRecord?: (record: AgentRecord) => void;
 	onUiRequest?: (record: AgentRecord, request: any) => Promise<Record<string, unknown> | void>;
@@ -721,11 +723,11 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 
 const resumingChildren = new Map<string, Promise<void>>();
 
-function waitForResume(pending: Promise<void>, signal?: AbortSignal): Promise<void> {
+function waitForMessage(pending: Promise<void>, signal?: AbortSignal, canCancelWait = () => true): Promise<void> {
 	if (!signal) return pending;
 	return new Promise((resolveWait, reject) => {
-		const abort = () => reject(new Error("Subagent message was aborted"));
-		if (signal.aborted) { abort(); return; }
+		const abort = () => { if (canCancelWait()) reject(new Error("Subagent message was aborted")); };
+		if (signal.aborted && canCancelWait()) { abort(); return; }
 		signal.addEventListener("abort", abort, { once: true });
 		pending.then(resolveWait, reject).finally(() => signal.removeEventListener("abort", abort));
 	});
@@ -735,8 +737,8 @@ function waitForResume(pending: Promise<void>, signal?: AbortSignal): Promise<vo
 export async function resumeSubagent(record: AgentRecord, message: string, context: SpawnContext): Promise<void> {
 	const pending = resumingChildren.get(record.runId);
 	if (pending) {
-		await waitForResume(pending, context.signal);
-		if (await sendSubagentMessage(record, message, context.signal)) return;
+		await waitForMessage(pending, context.signal);
+		if (await sendSubagentMessage(record, message, context.signal, context.resultRoute)) return;
 		const latest = readRecords(context.agentDir).find((item) => item.runId === record.runId);
 		if (!latest) throw new Error("Subagent record disappeared");
 		return resumeSubagent(latest, message, context);
@@ -772,7 +774,7 @@ export async function resumeSubagent(record: AgentRecord, message: string, conte
 			}
 		} finally { await file.close(); }
 		if (context.signal?.aborted) throw new Error("Subagent message was aborted");
-		const next = claimRecordForResume(context.agentDir, record);
+		const next = claimRecordForResume(context.agentDir, record, context.resultRoute);
 		next.maxDepth = maxDepth;
 		context.onRecord?.(next);
 		await launchRun({ task: message }, { ...context, settings: { ...context.settings, maxDepth } }, next, record.sessionFile);
@@ -1079,17 +1081,28 @@ async function runSubagentProcess(
 		};
 
 		let messageQueue = Promise.resolve();
+		let queuedFollowUp: { previousRoute: ResultRoute | undefined } | undefined;
 		const lifetime = new AbortController();
 		const liveChild: LiveChild = {
 			abort: () => lifetime.abort(),
-			sendMessage(message: string, signal?: AbortSignal) {
+			sendMessage(message: string, signal?: AbortSignal, resultRoute: ResultRoute = "parent") {
 				signal = signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+				let steeringIssued = false;
 				const result = messageQueue.then(async () => {
 					if (signal?.aborted) throw new Error("Subagent message was aborted");
-					const followUp = isTerminalStatus(record.status);
+					let followUp = isTerminalStatus(record.status);
 					if (closing || diskCancelled()) throw new Error("Subagent is no longer running");
-					const previousStatus = record.status;
 					if (followUp) {
+						// Fail safely before overwriting an uncollected delegation.
+						Object.assign(record, await saveRecordAsync(context.agentDir, record, signal));
+						// Native follow-ups can start while asynchronous persistence yields.
+						followUp = isTerminalStatus(record.status);
+					}
+					let previousStatus = record.status;
+					let previousRoute = record.resultRoute;
+					if (followUp) {
+						queuedFollowUp = { previousRoute };
+						record.resultRoute = resultRoute;
 						record.status = "queued";
 						record.activity = "waiting for a concurrency slot";
 						publish();
@@ -1098,20 +1111,44 @@ async function runSubagentProcess(
 					let promptIssued = false;
 					try {
 						releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency, signal) : undefined;
+						if (followUp && record.status !== "queued") {
+							// A native follow-up may start (and finish) during admission too.
+							if (isTerminalStatus(record.status)) Object.assign(record, await saveRecordAsync(context.agentDir, record, signal));
+							followUp = isTerminalStatus(record.status);
+							previousStatus = record.status;
+							previousRoute = record.resultRoute;
+							if (followUp) {
+								record.resultRoute = resultRoute;
+								record.status = "queued";
+								record.activity = "waiting for a concurrency slot";
+								publish();
+							} else {
+								releaseTurn?.();
+								releaseTurn = undefined;
+							}
+						}
 						if (releaseTurn) continuationReleases.push(releaseTurn);
 						if (signal?.aborted || closing || diskCancelled()) throw new Error("Subagent message was aborted");
+						queuedFollowUp = undefined;
 						const pendingPrompt = send(
 							{
 								type: "prompt",
 								message,
 								...(followUp ? {} : { streamingBehavior: "steer" }),
 							},
-							// Once a follow-up is on stdin, the child owns the turn. Caller abort
-							// must not drop the slot; agent_settled/close still release it.
-							{ signal: followUp ? lifetime.signal : signal },
+							// Once written, acceptance belongs to the child, independently of
+							// cancellation of the caller's wait (for follow-ups AND steering).
+							{ signal: lifetime.signal },
 						);
 						promptIssued = true;
+						steeringIssued = !followUp;
 						await pendingPrompt;
+						// Native skill/template expansion can change the emitted user text.
+						// RPC acceptance, not string matching, makes steering expected work.
+						if (!followUp && resultRoute === "parent" && record.resultRoute === "manual") {
+							record.resultRoute = "parent";
+							publish();
+						}
 					} catch (error) {
 						const keepSlot =
 							followUp &&
@@ -1130,14 +1167,21 @@ async function runSubagentProcess(
 						// "queued" and this must not overwrite that newer state.
 						if (followUp && record.status === "queued" && !diskCancelled()) {
 							record.status = previousStatus;
+							record.resultRoute = previousRoute;
 							record.activity = previousStatus;
 							publish();
 						}
 						throw error;
+					} finally {
+						queuedFollowUp = undefined;
 					}
 				});
+				// Keep ordering and acceptance accounting alive even if the caller
+				// stops waiting after the command has reached the child.
 				messageQueue = result.catch(() => {});
-				return result;
+				// Preserve the established accepted-follow-up acknowledgement contract;
+				// only active steering detaches its caller's wait from late acceptance.
+				return waitForMessage(result, signal, () => steeringIssued);
 			},
 		};
 
@@ -1173,6 +1217,11 @@ async function runSubagentProcess(
 					writeLine({ type: "extension_ui_response", id: event.id, cancelled: true });
 				}
 				return;
+			}
+			if (event.type === "agent_start" && queuedFollowUp) {
+				// This native turn predates our queued command, so it keeps its route.
+				record.resultRoute = queuedFollowUp.previousRoute;
+				queuedFollowUp = undefined;
 			}
 			const important = applyChildEvent(record, state, event);
 			if (event.type === "agent_settled") {
@@ -1302,7 +1351,7 @@ async function runSubagentProcess(
 			startingChildren.delete(record.runId);
 			onAccepted();
 			for (const message of startup?.messages ?? []) {
-				void liveChild.sendMessage(message).catch(() => {});
+				void liveChild.sendMessage(message.message, undefined, message.resultRoute).catch(() => {});
 			}
 			await initialDone;
 		} catch (error) {
