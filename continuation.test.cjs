@@ -162,12 +162,18 @@ async function until(predicate) {
     const beforeClaim = launches;
     const releaseClaim = holdRecordLock(busyClaim.runId);
     const claimStart = performance.now();
+    const claimAbort = new AbortController();
+    let claimTimerProgress = false;
+    const abortClaim = setTimeout(() => { claimTimerProgress = true; claimAbort.abort(); }, 25);
     try {
-      await assert.rejects(send(busyClaim.runId, 'not accepted'), error => error.code === 'EBUSY');
-      assert.ok(performance.now() - claimStart < 500, 'claim contention must preserve responsive input');
+      await assert.rejects(send(busyClaim.runId, 'not accepted', claimAbort.signal), /aborted/i);
+      assert.equal(claimTimerProgress, true, 'claim contention must yield to input timers');
+      assert.ok(performance.now() - claimStart < 500, 'abort must not wait for the registry lock deadline');
       assert.equal(row(busyClaim.runId).status, 'completed');
       assert.equal(launches, beforeClaim);
-    } finally { releaseClaim(); }
+    } finally { clearTimeout(abortClaim); releaseClaim(); }
+    await sleep(30);
+    assert.equal(launches, beforeClaim, 'a cancelled claim must not launch after the writer releases');
 
     const busyPublish = make('busy-publish');
     await send(busyPublish.runId, 'slow');

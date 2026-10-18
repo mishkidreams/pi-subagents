@@ -10,8 +10,8 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentRecord, AgentStatus, ResultRoute } from "./types.ts";
 
@@ -91,9 +91,34 @@ function atomicWrite(target: string, contents: string, retryRename = true): void
 	try {
 		if (retryRename) renameReplacing(temporary, target);
 		else renameSync(temporary, target);
+		// A later caller must not join a snapshot started before this local write.
+		snapshots.delete(resolve(dirname(target)));
 	} catch (error) {
 		rmSync(temporary, { force: true });
 		throw error;
+	}
+}
+
+/** Windows replacement retries that leave input/RPC/close callbacks runnable. */
+export async function renameReplacingAsync(from: string, to: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try { await rename(from, to); return; }
+		catch (error) {
+			if (!isTransientFsError(error) || attempt === REPLACE_ATTEMPTS - 1) throw error;
+			await delay(15 * (attempt + 1));
+		}
+	}
+}
+
+/** The UI/tool path must let Windows close handles while replacement is retried. */
+async function atomicWriteAsync(target: string, contents: string): Promise<void> {
+	const temporary = `${target}.tmp-${process.pid}-${randomToken()}`;
+	try {
+		await writeFile(temporary, contents, { encoding: "utf8", ...(process.platform === "win32" ? {} : { mode: 0o600 }) });
+		await renameReplacingAsync(temporary, target);
+		snapshots.delete(resolve(dirname(target)));
+	} finally {
+		await rm(temporary, { force: true }).catch(() => {});
 	}
 }
 
@@ -168,6 +193,20 @@ export function markRecordResultState(agentDir: string, record: AgentRecord, fla
 			}, 0);
 		} catch { /* The durable marker still suppresses it; never remove a newer result. */ }
 	}
+}
+
+/** Async parent/UI counterpart: no synchronous filesystem work or retry sleeps. */
+export async function markRecordResultStateAsync(agentDir: string, record: AgentRecord, flag: ResultStateFlag): Promise<void> {
+	await mkdir(registryDir(agentDir), { recursive: true, mode: 0o700 });
+	await atomicWriteAsync(resultStatePath(agentDir, record, flag), "true\n");
+	if (flag !== "resultsDelivered") return;
+	try {
+		await withAsyncRecordLock(agentDir, record.runId, async () => {
+			const target = resultArchivePath(agentDir, record);
+			const archived = JSON.parse(await readFile(target, "utf8")) as AgentRecord;
+			if (resultKey(archived) === resultKey(record)) await rm(target, { force: true });
+		});
+	} catch { /* The durable marker suppresses it; never remove a newer execution's outbox. */ }
 }
 
 function closedPath(agentDir: string, record: AgentRecord): string {
@@ -251,6 +290,38 @@ export function readParentResults(agentDir: string): AgentRecord[] {
 	return [...records.values()];
 }
 
+/** Same delivery/ownership rules as readParentResults, without scanning history on the event loop.
+ * A waiter can pass its already loaded full snapshot instead of taking a second one.
+ */
+export async function readParentResultsAsync(agentDir: string, current?: readonly AgentRecord[]): Promise<AgentRecord[]> {
+	current ??= await readRecordsAsync(agentDir);
+	const live = new Map(current.map((record) => [record.runId, record]));
+	const records = new Map<string, AgentRecord>();
+	let markerNames: Set<string>;
+	try { markerNames = new Set(await readdir(registryDir(agentDir))); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; markerNames = new Set(); }
+	const add = (record: AgentRecord) => {
+		if (!isTerminalStatus(record.status) || record.resultRoute === "manual") return;
+		for (const flag of RESULT_STATE_FLAGS) {
+			if (markerNames.has(resultStatePath(agentDir, record, flag).slice(registryDir(agentDir).length + 1))) record = { ...record, [flag]: true };
+		}
+		if (!record.resultsDelivered) records.set(record.runId, record);
+	};
+	const dir = join(agentDir, "subagents", "results");
+	let names: string[];
+	try { names = await readdir(dir); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; names = []; }
+	const archived = await readRecordFiles(dir, names);
+	for (const record of archived) {
+		const active = live.get(record.runId);
+		if (active && active.resultRoute !== "manual" &&
+			(!isTerminalStatus(active.status) || resultKey(active) !== resultKey(record))) continue;
+		add(record);
+	}
+	for (const record of current) add(record);
+	return [...records.values()];
+}
+
 /**
  * Persist an execution-owner record atomically. Parent/UI flags must use
  * markRecordResultState instead. Result flags, cancellation and close markers are
@@ -270,7 +341,10 @@ export async function saveRecordAsync(agentDir: string, record: AgentRecord, sig
 	const deadline = Date.now() + 2_000;
 	while (true) {
 		if (signal?.aborted) throw new Error("Subagent message was aborted");
-		try { return saveRecordWithRenameMode(agentDir, record, false); }
+		try {
+			return await withRecordLockAsync(agentDir, record.runId,
+				() => saveRecordWithRenameMode(agentDir, record, false), Math.max(0, deadline - Date.now()), signal);
+		}
 		catch (error) {
 			if (!isTransientFsError(error) || (error as NodeJS.ErrnoException).syscall !== "rename" || Date.now() >= deadline) throw error;
 			await delay(25, undefined, { signal });
@@ -295,13 +369,14 @@ function saveRecordWithRenameMode(agentDir: string, record: AgentRecord, retryRe
 }
 
 /** Reserve one new process, retaining run/session identity and permanent cancellation. */
-export function claimRecordForResume(agentDir: string, record: AgentRecord, resultRoute: ResultRoute = "parent"): AgentRecord {
+export function claimRecordForResume(agentDir: string, record: AgentRecord, resultRoute: ResultRoute = "parent", options?: { retryRename?: boolean }): AgentRecord {
 	return withRecordLock(agentDir, record.runId, () => {
-		const current = readRecords(agentDir).find((item) => item.runId === record.runId);
+		const current = readRecord(agentDir, record.runId);
 		if (!current || current.processInstanceId !== record.processInstanceId) throw new StaleSubagentProcessError();
 		if (current.status === "cancelled" || isRecordCancelled(agentDir, record.runId)) throw new Error(`${record.name} was cancelled`);
 		if (!isTerminalStatus(current.status) || isRecordedProcessAlive(current)) throw new Error(`${record.name} is still running`);
-		archiveParentResult(agentDir, current);
+		const retryRename = options?.retryRename !== false;
+		archiveParentResult(agentDir, current, retryRename);
 		const next: AgentRecord = {
 			...current, processInstanceId: randomUUID(), executionId: randomUUID(), resultRoute,
 			pid: undefined, pidStartTime: undefined, status: "queued", activity: "waiting for a concurrency slot",
@@ -309,7 +384,7 @@ export function claimRecordForResume(agentDir: string, record: AgentRecord, resu
 			resultsDelivered: false, resultsPreviewed: false, footerDismissed: false,
 			updatedAt: new Date().toISOString(),
 		};
-		atomicWrite(recordPath(agentDir, next.runId), `${JSON.stringify(next)}\n`);
+		atomicWrite(recordPath(agentDir, next.runId), `${JSON.stringify(next)}\n`, retryRename);
 		return next;
 	}, 0);
 }
@@ -332,6 +407,43 @@ function randomToken(): string {
 }
 
 const heldRecordLocks = new Set<string>();
+
+/** One nonblocking attempt, interoperable with the synchronous owner's lock.
+ * Async operations never borrow heldRecordLocks: an await must not admit another writer.
+ */
+async function withAsyncRecordLock<T>(agentDir: string, runId: string, operation: () => Promise<T>): Promise<T> {
+	const lock = join(registryDir(agentDir), `${safeRunId(runId)}.lock`);
+	const token = `${process.pid}-${randomToken()}`;
+	await mkdir(lock, { mode: 0o700 });
+	try {
+		await writeFile(join(lock, "owner"), `${token}\n`, { encoding: "utf8", mode: 0o600 });
+		return await operation();
+	} finally {
+		// The owner cannot be considered stale while this short async operation is alive.
+		try {
+			if ((await readFile(join(lock, "owner"), "utf8")).trim() === token) await rm(lock, { recursive: true, force: true });
+		} catch { /* Never remove a lock we no longer own. */ }
+	}
+}
+
+/** Wait asynchronously, then run one synchronous critical section (including nested owner writes).
+ * Never put an async callback here: heldRecordLocks must not span an await.
+ */
+export async function withRecordLockAsync<T>(
+	agentDir: string, runId: string, operation: () => T, waitMs = LOCK_WAIT_MS, signal?: AbortSignal,
+): Promise<T> {
+	const deadline = Date.now() + waitMs;
+	while (true) {
+		if (signal?.aborted) throw new Error("Subagent record operation was aborted");
+		let entered = false;
+		try { return withRecordLock(agentDir, runId, () => { entered = true; return operation(); }, 0); }
+		catch (error) {
+			// Retrying a partially executed callback could spawn or deliver twice.
+			if (entered || (error as NodeJS.ErrnoException).code !== "EBUSY" || Date.now() >= deadline) throw error;
+			await delay(Math.min(10, Math.max(1, deadline - Date.now())), undefined, { signal });
+		}
+	}
+}
 
 /** Serialize synchronous record operations; nested calls share this process\'s lock. */
 export function withRecordLock<T>(agentDir: string, runId: string, operation: () => T, waitMs = LOCK_WAIT_MS): T {
@@ -367,12 +479,14 @@ export function withRecordLock<T>(agentDir: string, runId: string, operation: ()
 			if (stale) {
 				const quarantine = `${lock}.stale-${process.pid}-${randomToken()}`;
 				try {
-					renameReplacing(lock, quarantine);
+					// Never sleep on a Windows handle while holding up the event loop.
+					renameSync(lock, quarantine);
 					rmSync(quarantine, { recursive: true, force: true });
+					continue;
 				} catch {
-					// Another contender replaced or removed the stale lock.
+					// A stale lock that cannot be moved must respect the same deadline.
 				}
-				continue;
+
 			}
 			if (Date.now() >= deadline) throw Object.assign(new Error(`Subagent record is busy; retry: ${runId}`), { code: "EBUSY" });
 			sleepSync(5);
@@ -640,48 +754,122 @@ export function readRecords(agentDir: string): AgentRecord[] {
 	return records;
 }
 
-/** Nonblocking UI snapshot. Marker names come from one directory listing, not five stats per run. */
-export async function readRecordsAsync(agentDir: string): Promise<AgentRecord[]> {
-	const dir = registryDir(agentDir);
-	let names: string[];
-	try {
-		names = await readdir(dir);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
+interface CachedRecord { stamp: string; value: AgentRecord }
+const recordCaches = new Map<string, Map<string, CachedRecord>>();
+const snapshots = new Map<string, Promise<AgentRecord[]>>();
+
+function recordCache(dir: string): Map<string, CachedRecord> {
+	const key = resolve(dir);
+	let cache = recordCaches.get(key);
+	if (!cache) {
+		cache = new Map();
+		// Tests/session switches can visit many roots. Do not retain them indefinitely.
+		if (recordCaches.size >= 8) recordCaches.delete(recordCaches.keys().next().value!);
+		recordCaches.set(key, cache);
 	}
-	const paths = new Set(names.map((name) => join(dir, name)));
-	const files = names.filter((name) => name.endsWith(".json"));
+	return cache;
+}
+
+function copyRecord(record: AgentRecord): AgentRecord {
+	return { ...record, ...(record.usage ? { usage: { ...record.usage } } : {}), ...(record.tools ? { tools: [...record.tools] } : {}) };
+}
+
+async function cachedRecord(file: string, cache: Map<string, CachedRecord>): Promise<AgentRecord | undefined> {
+	try {
+		const info = await stat(file);
+		const stamp = [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs].join(":");
+		const existing = cache.get(file);
+		if (existing?.stamp === stamp) return copyRecord(existing.value);
+		const value: unknown = JSON.parse(await readFile(file, "utf8"));
+		if (!isRecord(value)) { cache.delete(file); return undefined; }
+		cache.set(file, { stamp, value });
+		return copyRecord(value);
+	} catch {
+		cache.delete(file);
+		return undefined; // Malformed, concurrently removed, or temporarily unreadable.
+	}
+}
+
+async function readRecordFiles(dir: string, names: readonly string[]): Promise<AgentRecord[]> {
+	const files = names.filter((name) => name.endsWith(".json")).map((name) => join(dir, name));
+	const paths = new Set(files);
+	const cache = recordCache(dir);
+	for (const file of cache.keys()) if (!paths.has(file)) cache.delete(file);
 	const records = new Array<AgentRecord | undefined>(files.length);
 	let next = 0;
 	const readNext = async () => {
 		while (next < files.length) {
 			const index = next++;
-			try {
-				const value: unknown = JSON.parse(await readFile(join(dir, files[index]!), "utf8"));
-				if (!isRecord(value)) continue;
-				let cancellation: CancellationMarker | undefined;
-				const cancelledPath = markerPath(agentDir, value.runId, "cancelled");
-				if (paths.has(cancelledPath)) {
-					let text = "";
-					try { text = await readFile(cancelledPath, "utf8"); } catch { /* The marker still counts. */ }
-					cancellation = parseCancellationMarker(text, value.runId);
-				}
-				const marked = applyMarkers(value, {
-					flags: RESULT_STATE_FLAGS.filter((flag) => paths.has(resultStatePath(agentDir, value, flag))),
-					cancellation,
-					closed: paths.has(closedPath(agentDir, value)),
-				});
-				const alive = TERMINAL.has(marked.status) || !marked.pid || await isRecordedProcessAliveAsync(marked);
-				records[index] = alive ? marked : exitedRecord(marked);
-			} catch {
-				// Match readRecords: ignore malformed or concurrently removed records.
-			}
+			records[index] = await cachedRecord(files[index]!, cache);
 		}
 	};
-	// Bound open files and parsing work, even with a large accumulated history.
 	await Promise.all(Array.from({ length: Math.min(8, files.length) }, readNext));
 	return records.filter((record): record is AgentRecord => record !== undefined);
+}
+
+async function readMarkersAsync(agentDir: string, record: AgentRecord, paths?: ReadonlySet<string>): Promise<RecordMarkers> {
+	const present = async (file: string) => {
+		if (paths) return paths.has(file);
+		try { await stat(file); return true; } catch { return false; }
+	};
+	const cancelledPath = markerPath(agentDir, record.runId, "cancelled");
+	let cancellation: CancellationMarker | undefined;
+	if (await present(cancelledPath)) {
+		let text = "";
+		try { text = await readFile(cancelledPath, "utf8"); } catch { /* Existence remains authoritative. */ }
+		cancellation = parseCancellationMarker(text, record.runId);
+	}
+	const flags = await Promise.all(RESULT_STATE_FLAGS.map(async (flag) => await present(resultStatePath(agentDir, record, flag)) ? flag : undefined));
+	return { flags: flags.filter((flag): flag is ResultStateFlag => flag !== undefined), cancellation, closed: await present(closedPath(agentDir, record)) };
+}
+
+/** Exact-ID reads avoid walking every historical run for owner/lifecycle lookups. */
+export function readRecord(agentDir: string, runId: string): AgentRecord | undefined {
+	try {
+		const value: unknown = JSON.parse(readFileSync(recordPath(agentDir, runId), "utf8"));
+		if (!isRecord(value)) return undefined;
+		const marked = applyMarkers(value, readMarkers(agentDir, value));
+		return !TERMINAL.has(marked.status) && marked.pid && !isRecordedProcessAlive(marked) ? exitedRecord(marked) : marked;
+	} catch { return undefined; }
+}
+
+export async function readRecordAsync(agentDir: string, runId: string): Promise<AgentRecord | undefined> {
+	const value = await cachedRecord(recordPath(agentDir, runId), recordCache(registryDir(agentDir)));
+	if (!value) return undefined;
+	const marked = applyMarkers(value, await readMarkersAsync(agentDir, value));
+	return !TERMINAL.has(marked.status) && marked.pid && !await isRecordedProcessAliveAsync(marked) ? exitedRecord(marked) : marked;
+}
+
+/** Nonblocking, single-flight snapshot shared by panel and waiters.
+ * Unchanged response bodies are stat-validated, not reread/reparsed every poll.
+ * Marker names and PID liveness are always refreshed, never frozen in the cache.
+ */
+export async function readRecordsAsync(agentDir: string): Promise<AgentRecord[]> {
+	const dir = registryDir(agentDir);
+	const key = resolve(dir);
+	let snapshot = snapshots.get(key);
+	if (!snapshot) {
+		snapshot = (async () => {
+			let names: string[];
+			try { names = await readdir(dir); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+			const paths = new Set(names.map((name) => join(dir, name)));
+			const records = await readRecordFiles(dir, names);
+			let next = 0;
+			const refreshNext = async () => {
+				while (next < records.length) {
+					const index = next++;
+					const marked = applyMarkers(records[index]!, await readMarkersAsync(agentDir, records[index]!, paths));
+					records[index] = TERMINAL.has(marked.status) || !marked.pid || await isRecordedProcessAliveAsync(marked) ? marked : exitedRecord(marked);
+				}
+			};
+			await Promise.all(Array.from({ length: Math.min(8, records.length) }, refreshNext));
+			return records;
+		})();
+		snapshots.set(key, snapshot);
+		void snapshot.finally(() => { if (snapshots.get(key) === snapshot) snapshots.delete(key); }).catch(() => {});
+	}
+	return (await snapshot).map(copyRecord);
 }
 
 async function isRecordedProcessAliveAsync(record: AgentRecord): Promise<boolean> {

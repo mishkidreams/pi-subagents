@@ -32,9 +32,9 @@ export class TranscriptViewport {
 		this.following = bounded === 1;
 	}
 
-	render(body: string[], width: number, height: number, style: (text: string) => string): { lines: string[] } {
+	render(body: string[], width: number, height: number, style: (text: string) => string, tail: string[] = []): { lines: string[] } {
 		this.width = width;
-		this.total = body.length;
+		this.total = body.length + tail.length;
 		this.height = Math.max(0, height);
 		const maxTop = Math.max(0, this.total - this.height);
 		this.top = this.following ? maxTop : Math.min(this.top, maxTop);
@@ -42,7 +42,8 @@ export class TranscriptViewport {
 		const thumbTop = maxTop === 0 ? 0 : Math.round((this.height - thumb) * this.top / maxTop);
 		const textWidth = Math.max(0, width - 2);
 		const lines = Array.from({ length: this.height }, (_, row) => {
-			const text = truncateToWidth(body[this.top + row] ?? "", textWidth, "");
+			const index = this.top + row;
+			const text = truncateToWidth((index < body.length ? body[index] : tail[index - body.length]) ?? "", textWidth, "");
 			const bar = style(row >= thumbTop && row < thumbTop + thumb ? "█" : "░");
 			return width < 2 ? truncateToWidth(bar, width, "") : text + " ".repeat(Math.max(0, width - 1 - visibleWidth(text))) + bar;
 		});

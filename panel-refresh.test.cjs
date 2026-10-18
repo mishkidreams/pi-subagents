@@ -127,6 +127,7 @@ let releasePending;
 		registry.saveRecord(panelDir, second);
 		const panel = new SubagentPanel(tui, theme, panelDir, "root");
 		panels.push(panel);
+		await panel.ready();
 		assert.equal(panel.open(), true);
 		panel.handleInput("\x1b[B");
 		const text = () => panel.render(120).join("\n");
@@ -148,6 +149,9 @@ let releasePending;
 		failListing = undefined;
 		await until(() => text().includes("after recovery"), "fallback poll must recover after an I/O error");
 
+		// Dismiss uses the maintained snapshot, never a synchronous command-path reread.
+		registry.saveRecord(panelDir, { ...second, status: "completed" });
+		await until(() => panel.records.find(r => r.runId === second.runId)?.status === "completed", "completion reaches the maintained snapshot");
 		// Hold a pre-dismissal snapshot; releasing it must not resurrect a dismissed row.
 		const hold = holdNextRead(recordPath(panelDir, second.runId));
 		releasePending = hold.release;

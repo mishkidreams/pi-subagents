@@ -1,4 +1,4 @@
-import { statSync, watch, type FSWatcher } from "node:fs";
+import { watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, sep } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -17,7 +17,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords, readRecordsAsync, registryDir } from "./registry.ts";
+import { descendantsOf, isTerminalStatus, markRecordResultStateAsync, readRecordsAsync, registryDir, resultKey } from "./registry.ts";
 import { TranscriptView, discoverSessionFile } from "./transcript.ts";
 import { TranscriptViewport } from "./transcript-viewport.ts";
 import type { AgentRecord } from "./types.ts";
@@ -33,7 +33,7 @@ const COPY_FEEDBACK_MS = 2000;
 
 interface SubagentPanelOptions {
 	onMessage?: (record: AgentRecord, text: string) => Promise<void>;
-	onCancel?: (record: AgentRecord) => void;
+	onCancel?: (record: AgentRecord) => void | Promise<void>;
 	onCopyPath?: (path: string) => Promise<void>;
 }
 
@@ -112,8 +112,11 @@ export class SubagentPanel implements Component, Focusable {
 	private mainModel?: string;
 	private transcriptFile?: string;
 	private lastDiscover = 0;
+	private discovery?: Promise<void>;
+	private detailGeneration = 0;
 	private detailRunId?: string;
 	private detailStates = new Map<string, DetailState>();
+	private readonly transcriptLru = new Map<string, DetailState>();
 	private messageInput = new Input();
 	private detailGeometry?: {
 		width: number; bodyTop: number; bodyHeight: number; inputY: number; controlsY: number;
@@ -129,9 +132,14 @@ export class SubagentPanel implements Component, Focusable {
 	private watcher?: FSWatcher;
 	private refreshTimer?: ReturnType<typeof setTimeout>;
 	private refreshing = false;
+	private refreshWork?: Promise<void>;
 	private refreshQueued = false;
 	private refreshVersion = 0;
 	private disposed = false;
+	private readonly initialRefresh: Promise<void>;
+	private readonly dismissals = new Map<string, AgentRecord>();
+	private readonly dismissalQueue: AgentRecord[] = [];
+	private persistingDismissals = false;
 
 	get focused(): boolean {
 		return this._focused;
@@ -183,7 +191,7 @@ export class SubagentPanel implements Component, Focusable {
 				},
 			);
 		};
-		this.refresh();
+		this.initialRefresh = this.refreshAsync();
 		this.watchRegistry();
 		this.timer = setInterval(() => {
 			this.watchRegistry();
@@ -204,27 +212,65 @@ export class SubagentPanel implements Component, Focusable {
 		this.mainModel = model;
 	}
 
-	/** Hide finished subagents from the footer. Runs when the user starts a new turn. */
+	/** Initial registry loading is asynchronous, including explicit command entry. */
+	async ready(): Promise<void> {
+		await this.initialRefresh;
+		await this.refreshAsync();
+		if (!this.detail || this.disposed) return;
+		const record = this.selectedRecord();
+		if (!record) return;
+		let view = this.transcriptView(record);
+		await this.discovery;
+		if (!view && !this.disposed && this.detail) view = this.transcriptView(record);
+		await view?.ready();
+		if (this.disposed || !this.detail) return;
+		const width = this.detailGeometry?.width ?? this.tui.terminal?.columns ?? 80;
+		view?.render(Math.max(1, width - 2));
+		await view?.ready();
+	}
+
+	/** Hide immediately using the maintained snapshot; persistence never blocks input. */
 	dismissFinished(): number {
-		this.refresh();
 		let count = 0;
 		for (const record of this.records) {
 			if (!isTerminal(record) || record.footerDismissed) continue;
-			try {
-				markRecordResultState(this.agentDir, record, "footerDismissed");
-				count++;
-			} catch {
-				// One bad write must not block the rest.
-			}
+			const key = resultKey(record);
+			if (this.dismissals.has(key)) continue;
+			this.dismissals.set(key, record);
+			this.dismissalQueue.push(record);
+			count++;
 		}
-		if (count > 0) this.refresh();
+		if (count) {
+			this.refreshVersion++;
+			this.applyRecords(this.records);
+			this.tui.requestRender();
+			void this.persistDismissals();
+		}
 		return count;
+	}
+
+	private async persistDismissals(): Promise<void> {
+		if (this.persistingDismissals) return;
+		this.persistingDismissals = true;
+		try {
+			while (this.dismissalQueue.length) {
+				const record = this.dismissalQueue.shift()!;
+				try {
+					await markRecordResultStateAsync(this.agentDir, record, "footerDismissed");
+				} catch {
+					this.dismissals.delete(resultKey(record));
+				}
+			}
+		} finally {
+			this.persistingDismissals = false;
+			if (!this.disposed) void this.refreshAsync();
+		}
 	}
 
 	/** Down-arrow entry: only non-dismissed subagents. */
 	open(): boolean {
 		if (this.overlayHandle) this.closeDetail();
-		this.refresh();
+		void this.refreshAsync();
 		if (this.visible.length === 0) return false;
 		this.reviewing = false;
 		this.detail = false;
@@ -237,7 +283,7 @@ export class SubagentPanel implements Component, Focusable {
 	/** /subagents entry: full history including dismissed. */
 	openReview(): boolean {
 		if (this.overlayHandle) this.closeDetail();
-		this.refresh();
+		void this.refreshAsync();
 		if (this.records.length === 0) return false;
 		this.reviewing = true;
 		this.detail = false;
@@ -278,6 +324,8 @@ export class SubagentPanel implements Component, Focusable {
 		const record = this.selectedRecord();
 		if (!record) return;
 		this.detail = true;
+		this.detailGeneration++;
+		this.lastDiscover = 0;
 		this.messageInput.focused = false;
 		const state = this.stateFor(record.runId);
 		this.messageInput = state.input;
@@ -286,6 +334,7 @@ export class SubagentPanel implements Component, Focusable {
 			this.transcriptFile = undefined;
 		}
 		this.detailRunId = record.runId;
+		this.transcriptView(record);
 
 		// A focused overlay is important here: Pi's fullscreen TUI otherwise
 		// consumes page keys and mouse-wheel events for the main conversation
@@ -345,10 +394,12 @@ export class SubagentPanel implements Component, Focusable {
 	}
 
 	private closeDetail(): void {
+		this.detailGeneration++;
 		if (this.detailRunId) {
 			const state = this.stateFor(this.detailRunId);
 			state.draft = this.messageInput.getValue();
 			this.clearCopyFeedback(state);
+			state.transcript?.view.pause();
 		}
 		this.detail = false;
 		this.draggingScrollbar = false;
@@ -407,7 +458,16 @@ export class SubagentPanel implements Component, Focusable {
 		this.refreshTimer.unref?.();
 	}
 
-	private async refreshAsync(): Promise<void> {
+	private refreshAsync(): Promise<void> {
+		if (this.refreshWork) { this.refreshQueued = true; return this.refreshWork; }
+		const work = this.readSnapshot().finally(() => {
+			if (this.refreshWork === work) this.refreshWork = undefined;
+		});
+		this.refreshWork = work;
+		return work;
+	}
+
+	private async readSnapshot(): Promise<void> {
 		if (this.disposed) return;
 		if (this.refreshing) {
 			this.refreshQueued = true;
@@ -423,9 +483,9 @@ export class SubagentPanel implements Component, Focusable {
 				this.refreshQueued = true;
 				return;
 			}
-			const before = JSON.stringify(this.records);
+			const before = this.snapshotKey();
 			this.applyRecords(records);
-			if (before !== JSON.stringify(this.records)) this.tui.requestRender();
+			if (before !== this.snapshotKey()) this.tui.requestRender();
 		} catch {
 			// Keep the last good snapshot on transient storage errors; retry on the next wake.
 		} finally {
@@ -437,14 +497,19 @@ export class SubagentPanel implements Component, Focusable {
 		}
 	}
 
-	private refresh(): void {
-		this.refreshVersion++;
-		this.applyRecords(readRecords(this.agentDir));
+	private snapshotKey(): string {
+		// Responses can be megabytes. Only UI-changing metadata belongs in this comparison.
+		return JSON.stringify(this.records.map(record => [record.runId, record.updatedAt, record.status,
+			record.footerDismissed, record.activity, record.currentTool, record.model, record.conversationRevision]));
 	}
 
 	private applyRecords(records: AgentRecord[]): void {
 		const selectedId = this.rows()[this.selected]?.runId;
-		this.records = descendantsOf(records, this.currentRunId);
+		this.records = descendantsOf(records, this.currentRunId).map(record => {
+			const key = resultKey(record);
+			if (record.footerDismissed) this.dismissals.delete(key);
+			return this.dismissals.has(key) ? { ...record, footerDismissed: true } : record;
+		});
 		this.visible = this.records.filter((record) => !record.footerDismissed);
 		const rows = this.rows();
 		const restored = selectedId ? rows.findIndex((record) => record.runId === selectedId) : -1;
@@ -588,7 +653,9 @@ export class SubagentPanel implements Component, Focusable {
 			const record = this.rows()[this.selected];
 			if (record && !isTerminal(record)) {
 				try {
-					this.options.onCancel?.(record);
+					void Promise.resolve(this.options.onCancel?.(record)).catch(() => {
+						// Async cancellation failure must not become an unhandled rejection.
+					});
 				} catch {
 					// stdin delivers this key. The callback's failure must not
 					// become the uncaughtException that exits Pi.
@@ -668,35 +735,39 @@ export class SubagentPanel implements Component, Focusable {
 		const file = record.sessionFile ?? this.transcriptFile;
 		if (!file) {
 			const now = Date.now();
-			if (now - this.lastDiscover > 2000) {
+			if (!this.discovery && now - this.lastDiscover > 2000) {
 				this.lastDiscover = now;
-				void discoverSessionFile(record.cwd, record.sessionId).then((found) => {
-					if (found && this.selectedRecord()?.runId === record.runId) {
+				const generation = this.detailGeneration;
+				const pending = discoverSessionFile(record.cwd, record.sessionId).then((found) => {
+					if (!this.disposed && this.detail && generation === this.detailGeneration && found && this.selectedRecord()?.runId === record.runId) {
 						this.transcriptFile = found;
 						this.tui.requestRender();
 					}
+				}).finally(() => {
+					if (this.discovery === pending) this.discovery = undefined;
 				});
+				this.discovery = pending;
 			}
 			return null;
 		}
 		if (record.sessionFile) this.transcriptFile = record.sessionFile;
-		let key: string;
-		try {
-			const stat = statSync(file);
-			key = `${file}:${stat.mtimeMs}:${stat.size}`;
-		} catch {
-			return null;
-		}
 		const state = this.stateFor(record.runId);
-		if (!state.transcript || state.transcript.key !== key) {
-			const view = state.transcript?.view ?? new TranscriptView(this.tui, record.cwd);
-			if (!view.update(file)) {
-				if (!state.transcript) view.dispose();
-				return null;
-			}
-			state.transcript = { key, view };
+		if (!state.transcript || state.transcript.key !== file) {
+			state.transcript?.view.dispose();
+			state.transcript = { key: file, view: new TranscriptView(this.tui, record.cwd) };
 		}
-		return state.transcript?.view ?? null;
+		// Keep recent disclosure state without retaining every opened transcript forever.
+		this.transcriptLru.delete(record.runId);
+		this.transcriptLru.set(record.runId, state);
+		while (this.transcriptLru.size > 4) {
+			const [runId, oldest] = this.transcriptLru.entries().next().value!;
+			oldest.transcript?.view.dispose();
+			oldest.transcript = undefined;
+			this.transcriptLru.delete(runId);
+		}
+		// The shared reader validates metadata asynchronously and is single-flight.
+		void state.transcript.view.update(file);
+		return state.transcript.view;
 	}
 
 	private legacyDetail(record: AgentRecord, width: number): string[] {
@@ -753,11 +824,10 @@ export class SubagentPanel implements Component, Focusable {
 		const textWidth = Math.max(1, width - 2);
 		const transcript = this.transcriptView(record);
 		const rendered = transcript?.render(textWidth);
-		const body = rendered?.length ? rendered.map(clean) : this.legacyDetail(record, textWidth);
-		if (rendered?.length && record.activity === "responding" && record.latestText) {
-			body.push("", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText, textWidth));
-		}
-		const view = state.viewport.render(body, width, Math.max(0, height - header.length - footer.length - 1), text => this.theme.fg("dim", text));
+		const body = rendered?.length ? rendered : this.legacyDetail(record, textWidth);
+		const live = rendered?.length && record.activity === "responding" && record.latestText
+			? ["", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText.slice(-4000), textWidth)] : [];
+		const view = state.viewport.render(body, width, Math.max(0, height - header.length - footer.length - 1), text => this.theme.fg("dim", text), live);
 		const labels = width >= 50 ? ["[Esc back]", "[↑ Start]", "[↓ Latest]"] : width >= 28 ? ["[Esc back]", "[Start]", "[Latest]"] : ["[Esc]", "[↑]", "[↓]"];
 		let column = 0;
 		const buttons = labels.map((label, index) => {

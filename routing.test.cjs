@@ -161,7 +161,7 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     await check();
     if (process.argv.includes('--progress-check')) {console.log('ALL PROGRESS TESTS PASS');return;}
     await manual('MANUAL_ONE');
-    assert.equal(preview(),undefined,'manual child reply must NOT append to an unrelated parent tool result');
+    assert.equal(await preview(),undefined,'manual child reply must NOT append to an unrelated parent tool result');
     handlers.get('agent_settled')(); await sleep(50);
     assert.equal(deliveries.length,0,'manual child reply must NOT wake an idle parent');
     const quiet = await check();
@@ -177,7 +177,7 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     handlers.get('agent_start')({},ctx);
     await send('DELEGATED'); await until(()=>row()?.latestText==='reply: DELEGATED' && row()?.status==='completed');
     await manual('MANUAL_TWO');
-    const pending = preview();
+    const pending = await preview();
     assert.match(pending.content.at(-1).text,/reply: DELEGATED/,'manual follow-up must not overwrite an uncollected delegated result');
     assert.ok(!pending.content.at(-1).text.includes('reply: MANUAL_TWO'));
     const collected = await check();
@@ -229,7 +229,7 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     const queuedSend = send('AFTER_QUEUED_PARENT');queuedSend.catch(()=>{});
     try {
       await until(()=>row()?.status==='queued');
-      assert.equal(preview(),undefined,'a live queued parent follow-up supersedes its old result before a new execution ID is assigned');
+      assert.equal(await preview(),undefined,'a live queued parent follow-up supersedes its old result before a new execution ID is assigned');
       assert.ok(!(await check()).content[0].text.includes('reply: BEFORE_QUEUED_PARENT'));
     } finally { releaseSlot(); }
     await queuedSend;await until(()=>row()?.latestText==='reply: AFTER_QUEUED_PARENT' && row()?.status==='completed');await check();
@@ -240,7 +240,7 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     assert.match((await check()).content[0].text,/reply: \/skill:fixture/);
     await until(()=>panel.renderDetailForOverlay(80).some(line=>line.includes('Sent')));panel.handleInput('\x1b');
     await manual('AFTER_EXPANDED_STEERING');assert.equal(row().resultRoute,'manual','the next manual follow-up must not inherit a stale steering route');
-    assert.equal(preview(),undefined);
+    assert.equal(await preview(),undefined);
     console.log('ok - transformed parent steering is collectable and leaves no stale route for the next manual turn');
     await send('BEFORE_AUTONOMOUS');await until(()=>row()?.latestText==='reply: BEFORE_AUTONOMOUS' && row()?.status==='completed');await check();
     renameFault={target,onlyStatus:'completed',notify:file+'.autonomous'};

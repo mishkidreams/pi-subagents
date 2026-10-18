@@ -1,6 +1,6 @@
 import { mkdirSync, watch, type FSWatcher } from "node:fs";
 import { resolve } from "node:path";
-import { descendantsOf, isTerminalStatus, readRecords, registryDir } from "./registry.ts";
+import { descendantsOf, isTerminalStatus, readRecordsAsync, registryDir } from "./registry.ts";
 import type { AgentRecord } from "./types.ts";
 
 const DEFAULT_POLL_MS = 250;
@@ -15,7 +15,7 @@ export interface WaitUntilIdleOptions {
 
 export interface WaitForResultOptions extends WaitUntilIdleOptions {
 	/** Called with a fresh snapshot; return true when the caller has something new to report. */
-	isReady: (rows: readonly AgentRecord[]) => boolean;
+	isReady: (rows: readonly AgentRecord[]) => boolean | Promise<boolean>;
 }
 
 interface Waiter {
@@ -37,8 +37,8 @@ function dirKey(agentDir: string): string {
 	return resolve(agentDir);
 }
 
-function snapshotDescendants(agentDir: string, parentRunId: string): AgentRecord[] {
-	return descendantsOf(readRecords(agentDir), parentRunId);
+async function snapshotDescendants(agentDir: string, parentRunId: string): Promise<AgentRecord[]> {
+	return descendantsOf(await readRecordsAsync(agentDir), parentRunId);
 }
 
 function isIdle(rows: readonly AgentRecord[]): boolean {
@@ -77,7 +77,12 @@ function ensureWatch(agentDir: string, pollMs: number): void {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	let watcher: FSWatcher | undefined;
 	try {
-		watcher = watch(dir, () => scheduleWake(agentDir));
+		watcher = watch(dir, (_event, filename) => {
+			// Progress writes create temporary files and lock directories too. Only
+			// committed records/markers (or an unspecified event) can change readiness.
+			if (filename !== null && !/\.(json|cancelled|closed|resultsDelivered|resultsPreviewed)$/.test(String(filename))) return;
+			scheduleWake(agentDir);
+		});
 		watcher.on("error", () => {
 			try {
 				watcher?.close();
@@ -152,19 +157,17 @@ async function waitForDescendants(
 	agentDir: string,
 	parentRunId: string,
 	options: WaitUntilIdleOptions,
-	isDone: (rows: readonly AgentRecord[]) => boolean,
+	isDone: (rows: readonly AgentRecord[]) => boolean | Promise<boolean>,
 ): Promise<AgentRecord[]> {
-	const timeoutMs = options.timeoutMs;
-	const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
-	const snapshot = () => snapshotDescendants(agentDir, parentRunId);
-	let rows = snapshot();
-	if (isDone(rows) || timeoutMs <= 0) return rows;
 	if (options.signal?.aborted) throw new Error("check_subagents was aborted");
-
+	if (options.timeoutMs <= 0) return snapshotDescendants(agentDir, parentRunId);
 	return new Promise<AgentRecord[]>((resolveWait, rejectWait) => {
 		let settled = false;
-		const key = dirKey(agentDir);
+		let checking = false;
+		let pending = false;
+		let rows: AgentRecord[] = [];
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let watching = false;
 		const onAbort = () => finish(new Error("check_subagents was aborted"));
 		const finish = (error?: Error) => {
 			if (settled) return;
@@ -172,36 +175,38 @@ async function waitForDescendants(
 			if (timer) clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
 			waiters.delete(waiter);
-			releaseWatch(agentDir);
-			if (error) rejectWait(error);
-			else {
-				try {
-					resolveWait(snapshot());
-				} catch (snapshotError) {
-					rejectWait(snapshotError instanceof Error ? snapshotError : new Error(String(snapshotError)));
-				}
-			}
+			if (watching) releaseWatch(agentDir);
+			// Do not add a final scan, especially on abort/timeout while I/O is slow.
+			if (error) rejectWait(error); else resolveWait(rows);
 		};
-		const waiter: Waiter = {
-			agentDir: key,
-			wake() {
-				try {
-					if (isDone(snapshot())) finish();
-				} catch {
-					// Keep waiting until timeout; a transient read must not fail the tool.
-				}
-			},
+		const check = async () => {
+			if (settled) return;
+			if (checking) { pending = true; return; }
+			checking = true;
+			try {
+				do {
+					pending = false;
+					const fresh = await snapshotDescendants(agentDir, parentRunId);
+					if (settled) return;
+					rows = fresh;
+					if (await isDone(rows)) { finish(); return; }
+				} while (pending && !settled);
+			} catch {
+				// A transient read must not fail the tool; the next wake/poll retries.
+			} finally { checking = false; }
 		};
+		const waiter: Waiter = { agentDir: dirKey(agentDir), wake: () => { void check(); } };
 		waiters.add(waiter);
-		ensureWatch(agentDir, pollMs);
-		timer = setTimeout(() => finish(), timeoutMs);
-		if (options.signal) {
-			if (options.signal.aborted) {
-				onAbort();
-				return;
-			}
-			options.signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			ensureWatch(agentDir, options.pollMs ?? DEFAULT_POLL_MS);
+			watching = true;
+		} catch (error) {
+			finish(error instanceof Error ? error : new Error(String(error)));
+			return;
 		}
-		waiter.wake();
+		// Install cancellation/deadline before starting the first asynchronous read.
+		timer = setTimeout(() => finish(), options.timeoutMs);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted) onAbort(); else waiter.wake();
 	});
 }

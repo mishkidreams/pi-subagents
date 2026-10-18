@@ -3,6 +3,7 @@
 const { execSync, execFileSync, spawn: spawnProcess } = require("node:child_process");
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -29,6 +30,14 @@ fs.renameSync = (from, to) => {
 		throw error;
 	}
 	return realRenameSync(from, to);
+};
+const realRename = fsp.rename;
+fsp.rename = async (from, to) => {
+	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && /\.(resultsDelivered|resultsPreviewed)$/.test(String(to))) {
+		injectedMarkerFailures++;
+		throw new Error("injected marker write failure");
+	}
+	return realRename(from, to);
 };
 
 // Installed before jiti captures child_process, so registry probes see the override.
@@ -142,6 +151,11 @@ function check(name, cond, extra) {
 		failures++;
 		console.error(`FAIL - ${name}${extra !== undefined ? `: ${extra}` : ""}`);
 	}
+}
+
+async function waitFor(predicate) {
+	const deadline = Date.now() + 5000;
+	while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 (async () => {
@@ -580,7 +594,7 @@ function check(name, cond, extra) {
 		for (let i = 0; i < 100 && automaticGrandchildMessages < 1; i++) await new Promise((r) => setTimeout(r, 25));
 		check("automatic grandchild delivery reaches direct parent", automaticGrandchildMessages === 1, String(automaticGrandchildMessages));
 		check("automatic grandchild delivery is claimed by direct parent", registry.readRecords(checkAgentDir).find((r) => r.runId === "automatic-grand")?.resultsDelivered === true);
-		childHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
+		await childHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 
 		// A failed automatic send leaves the result pending and schedules another attempt.
 		let automaticSendAttempts = 0;
@@ -627,26 +641,34 @@ function check(name, cond, extra) {
 		registry.saveRecord(checkAgentDir, checkRecord("boundary-child", "completed", { latestText: "fresh boundary result", executionId: "first" }));
 		const toolEvent = { toolName: "read", content: [{ type: "text", text: "original tool output" }] };
 		const aborted = new AbortController(); aborted.abort();
-		const abortedDelivery = checkHandlers.get("tool_result")(toolEvent, { signal: aborted.signal });
+		const abortedDelivery = await checkHandlers.get("tool_result")(toolEvent, { signal: aborted.signal });
 		check("aborted tool boundary does not consume reports", abortedDelivery === undefined && !registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsDelivered);
 		checkHandlers.get("agent_settled")();
 		await new Promise((r) => setTimeout(r, 50));
 		check("Esc does not wake the parent with pending reports", queuedReports.length === 0);
 		checkHandlers.get("agent_start")({}, {});
-		const boundary = checkHandlers.get("tool_result")(toolEvent, {});
+		const boundary = await checkHandlers.get("tool_result")(toolEvent, {});
 		check("tool boundary preserves original output", boundary.content[0].text === "original tool output");
 		check("tool boundary includes fresh report", boundary.content[1].text.includes("fresh boundary result"));
 		check("tool boundary is a preview, not a claim", registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsDelivered !== true && registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsPreviewed === true);
-		check("next sibling tool result does not repeat report", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
+		check("next sibling tool result does not repeat report", (await checkHandlers.get("tool_result")(toolEvent, {})) === undefined);
 		const afterBoundary = await checkTool.execute("after-boundary", {}, undefined, undefined, {});
 		check("check returns a boundary-previewed report once", afterBoundary.content[0].text.includes("fresh boundary result"));
 		const afterBoundaryAgain = await checkTool.execute("after-boundary-again", {}, undefined, undefined, {});
 		check("check omits a report it already collected", !afterBoundaryAgain.content[0].text.includes("fresh boundary result"));
 
+		registry.saveRecord(checkAgentDir, checkRecord("concurrent-preview", "completed", { latestText: "one shared preview", executionId: "parallel" }));
+		const parallelPreviews = await Promise.all([
+			checkHandlers.get("tool_result")(toolEvent, {}),
+			checkHandlers.get("tool_result")(toolEvent, {}),
+		]);
+		check("parallel tool boundaries preview a shared result only once", parallelPreviews.filter(Boolean).length === 1);
+		await checkTool.execute("parallel-preview-collect", { wait: false }, undefined, undefined, {});
+
 		// Pi 0.99 deletes structuredContent when a handler replaces `content` unless the
 		// handler returns it too. Preserve it so outputSchema tools (codemode, MCP) keep working.
 		registry.saveRecord(checkAgentDir, checkRecord("structured-child", "completed", { latestText: "structured result", executionId: "sc1" }));
-		const structuredBoundary = checkHandlers.get("tool_result")({
+		const structuredBoundary = await checkHandlers.get("tool_result")({
 			toolName: "codemode",
 			content: [{ type: "text", text: "original structured output" }],
 			structuredContent: { answer: 42 },
@@ -659,7 +681,7 @@ function check(name, cond, extra) {
 		// (for example from codemode). They are not the parent's completed tool, so the
 		// handler must skip them instead of claiming a preview on their behalf.
 		registry.saveRecord(checkAgentDir, checkRecord("nested-child", "completed", { latestText: "nested result", executionId: "n1" }));
-		const nestedBoundary = checkHandlers.get("tool_result")({
+		const nestedBoundary = await checkHandlers.get("tool_result")({
 			toolName: "read",
 			parentToolCallId: "call-outer/1",
 			content: [{ type: "text", text: "nested output" }],
@@ -745,7 +767,7 @@ function check(name, cond, extra) {
 
 		// A best-effort preview is not re-sent by the idle batch, but check still collects it.
 		registry.saveRecord(checkAgentDir, checkRecord("preview-batch", "completed", { latestText: "preview batch result", executionId: "pb1" }));
-		checkHandlers.get("tool_result")(toolEvent, {});
+		await checkHandlers.get("tool_result")(toolEvent, {});
 		checkHandlers.get("agent_settled")();
 		await new Promise((r) => setTimeout(r, 50));
 		check("previewed result is not re-sent by the idle batch", !queuedReports.some((report) => report.message.content.includes("preview batch result")));
@@ -771,11 +793,11 @@ function check(name, cond, extra) {
 		let faultResult;
 		try {
 			failMarkerWritesFor = "marker-failure";
-			faultResult = checkHandlers.get("tool_result")(toolEvent, {});
+			faultResult = await checkHandlers.get("tool_result")(toolEvent, {});
 		} finally { failMarkerWritesFor = undefined; }
 		check("marker failure injection exercised", injectedMarkerFailures === 1);
 		check("partial marker failure preserves all reports", faultResult.content[1].text.includes("good marker report") && faultResult.content[1].text.includes("failed marker report"));
-		check("in-memory receipt prevents failed-marker replay", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
+		check("in-memory receipt prevents failed-marker replay", (await checkHandlers.get("tool_result")(toolEvent, {})) === undefined);
 		check("tool result contains durable preview receipts", faultResult.details.previewResultKeys.length === 2);
 		await checkHandlers.get("session_shutdown")({}, { mode: "rpc" });
 		await checkHandlers.get("session_start")({}, {
@@ -794,7 +816,7 @@ function check(name, cond, extra) {
 		const restoredAgain = await checkTool.execute("restored-direct-again", {}, undefined, undefined, {});
 		check("reload receipts prevent a repeat after collection", !restoredAgain.content[0].text.includes("failed marker report"));
 	} finally {
-		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
+		await checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		if (previousRunId === undefined) delete process.env.PI_SUBAGENT_RUN_ID;
@@ -845,7 +867,7 @@ function check(name, cond, extra) {
 	const composedEditor = installedEditorFactory({}, {}, { matches: () => false });
 	composedEditor.handleInput("z");
 	check("existing custom editor is composed instead of replaced", composedEditor === existingEditor && delegatedInput === "z");
-	editorHandlers.get("session_shutdown")?.({}, { mode: "tui", ui: editorUi });
+	await editorHandlers.get("session_shutdown")?.({}, { mode: "tui", ui: editorUi });
 	check("session shutdown restores the previous custom editor", currentEditorFactory === originalEditorFactory);
 
 	registry.saveRecord(agentDir2, mk("child1", "root", { status: "thinking" }));
@@ -998,12 +1020,14 @@ function check(name, cond, extra) {
 		},
 	};
 	let panel = new SubagentPanel(tui, theme, agentDir2, "nope");
+	await panel.ready();
 	check("empty renders nothing", panel.render(80).length === 0);
 	panel.dispose();
 
 	registry.saveRecord(agentDir2, mk("alpha", "root2", { status: "running_tool", currentTool: "bash npm test", latestText: "testing…", model: "prov/model-x" }));
 	registry.saveRecord(agentDir2, mk("beta", "root2"));
 	panel = new SubagentPanel(tui, theme, agentDir2, "root2");
+	await panel.ready();
 	panel.setMainModel("p/m");
 	const summary = panel.render(100);
 	check("footer shows main with model", summary.length > 0 && summary[0].includes("main") && summary[0].includes("p/m"), JSON.stringify(summary));
@@ -1967,8 +1991,10 @@ function check(name, cond, extra) {
 	const navPanel = new SubagentPanel(tui, theme, agentDir2, "root2", {
 		onMessage: async (record, text) => { sentFromPanel = `${record.runId}:${text}`; },
 	});
+	await navPanel.ready();
 	tui.setFocus(navPanel);
 	navPanel.handleInput("\x1b[C");
+	await waitFor(() => activeOverlay?.render(100).some((line) => line.includes("navigation message")));
 	const detailView = activeOverlay ? activeOverlay.render(100) : navPanel.render(100);
 	check("right opens focused transcript overlay", !!activeOverlay && detailView.some((l) => l.includes("navigation message")), detailView.join(" | "));
 	check("transcript overlay owns focus", focusedComponent === activeOverlay && navPanel.focused === false, `${focusedComponent === activeOverlay} ${navPanel.focused} ${focusedComponent?.constructor?.name} ${activeOverlay?.constructor?.name}`);
@@ -2018,10 +2044,10 @@ function check(name, cond, extra) {
 		sessionId: selectedSession.getSessionId(),
 	}));
 	const selectionPanel = new SubagentPanel(tui, theme, selectionRegistry, "selection-root");
+	await selectionPanel.ready();
 	tui.setFocus(selectionPanel);
 	selectionPanel.handleInput("\x1b[C");
-	activeOverlay.render(100);
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	await waitFor(() => activeOverlay?.render(100).some((line) => line.includes("selected visible transcript")));
 	const selectedTranscript = activeOverlay.render(100).join("\n");
 	check("transcript discovery follows the selected visible row", selectedTranscript.includes("selected visible transcript"), selectedTranscript);
 	selectionPanel.dispose();
@@ -2075,6 +2101,7 @@ function check(name, cond, extra) {
 	registry.saveRecord(agentDir3, r3("a2", "a", { name: "a2" }));
 	registry.saveRecord(agentDir3, r3("b", "root", { name: "b" }));
 	const tree = new SubagentPanel(tui, theme, agentDir3, "root");
+	await tree.ready();
 	const foot = tree.render(100);
 	check("footer nests grandchildren", foot.some((l) => l.includes("a1")) && foot.some((l) => l.includes("b")), foot.join(" | "));
 	check("footer uses tree guides", foot.some((l) => l.includes("├─") || l.includes("└─")), foot.join(" | "));
@@ -2101,6 +2128,7 @@ function check(name, cond, extra) {
 			spawn.cancelSubagent(cancelDir, record);
 		},
 	});
+	await cancelPanel.ready();
 	check("cancel panel opens a running row", cancelPanel.open() === true);
 	renameFaults = 100;
 	try {

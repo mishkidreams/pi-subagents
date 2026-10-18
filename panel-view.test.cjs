@@ -61,8 +61,10 @@ const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: t => S
       },
       onCancel: () => { cancelled++; },
     });
+    await panel.ready();
     assert.equal(panel.openReview(), true);
     ui.handleTerminalInput('\x1b[C');
+    frame(); await panel.ready();
     let screen = frame();
     assert.ok(!screen.some(l => l.includes('PARENT_SENTINEL')), 'the child view must cover the parent, including all terminal edges');
     assert.ok(screen[0].includes('actual-child-name'), 'actual child identity is pinned at top');
@@ -89,7 +91,7 @@ const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: t => S
     assert.notDeepEqual(older, latest);
     assert.ok(frame()[0].includes('actual-child-name'));
     assert.equal(parent.scrollTop, parentTop, 'page keys must not scroll the parent');
-    append(70, 75);
+    append(70, 75); await panel.ready();
     assert.deepEqual(body(), older, 'appended child messages must not move a reader of old history');
     ui.handleTerminalInput('\x1b[<65;5;8M');
     assert.notDeepEqual(body(), older, 'native SGR mouse wheel scrolls the child');
@@ -98,7 +100,7 @@ const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: t => S
 
     click('[↓ Latest]');
     assert.ok(body().some(l => l.includes('CHILD_MESSAGE 74')), 'mouse alone reaches latest');
-    append(75, 76);
+    append(75, 76); await panel.ready();
     assert.ok(body().some(l => l.includes('CHILD_MESSAGE 75')), 'Latest resumes follow-tail');
     click('[↑ Start]');
     assert.ok(body().some(l => l.includes('CHILD_MESSAGE 0')), 'mouse alone reaches the original prompt');
@@ -161,6 +163,7 @@ const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: t => S
     registry.saveRecord(sandbox, { ...record, status: 'thinking', finishedAt: undefined, pid: process.pid });
     const other = { ...record, runId: 'other-child-id', name: 'other-child', startedAt: '2026-01-01T00:00:02Z' };
     registry.saveRecord(sandbox, other);
+    await panel.ready();
     const openChild = name => {
       assert.equal(panel.openReview(), true);
       panel.handleInput('\x1b[A');

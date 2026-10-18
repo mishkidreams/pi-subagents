@@ -50,6 +50,7 @@ const theme={fg:(_c,t)=>String(t),bg:(_c,t)=>String(t),bold:t=>String(t)};
       if(pending)await pending;
     },onCancel:()=>{cancelled++;}};
     panel=new SubagentPanel(ui,theme,sandbox,'root',options);panel.setEditor(editor);
+    await panel.ready();
     const open=label=>{
       assert.equal(panel.openReview(),true);panel.handleInput('\x1b[A');panel.openReview();
       for(let i=0;i<records.length;i++){
@@ -129,6 +130,7 @@ const theme={fg:(_c,t)=>String(t),bg:(_c,t)=>String(t),bold:t=>String(t)};
     console.log('ok - in-flight Esc, dedup, parent typing, late ack and parent undo stay isolated');
 
     panel.dispose();panel=new SubagentPanel(ui,theme,sandbox,'root',options);panel.setEditor(editor);
+    await panel.ready();
     const beforeRecreate=childSent.length;
     open('A');assert.ok(!field().includes('MEMORY_ONLY_A'),'recreating a panel does not load drafts from saved history');
     key('\r');await flush();assert.equal(childSent.length,beforeRecreate,'recreating/reopening never auto-submits a draft');

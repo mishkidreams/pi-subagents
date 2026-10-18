@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { isProcessAlive, renameReplacing } from "./registry.ts";
+import { isProcessAlive, renameReplacingAsync } from "./registry.ts";
 import type { ResultRoute } from "./types.ts";
 
 interface Request {
@@ -18,21 +18,40 @@ function removeRequest(dir: string): void {
 const directory = (agentDir: string, owner: string) =>
 	join(agentDir, "subagents", "owner-inbox", owner.replace(/[^a-zA-Z0-9._-]/g, "_"));
 
+/** Async liveness/rename work must not postpone revocation when the sender cancels. */
+function abortable<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return pending;
+	return new Promise((resolve, reject) => {
+		const abort = () => reject(new Error("Subagent message was aborted"));
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+		pending.then(
+			(value) => { signal.removeEventListener("abort", abort); resolve(value); },
+			(error) => { signal.removeEventListener("abort", abort); reject(error); },
+		);
+	});
+}
+
 /** Await owner admission/RPC acceptance, not merely a filesystem enqueue.
  * Removing the request directory revokes a request still waiting for admission.
  */
 export async function requestOwnerMessage(
 	agentDir: string, owner: string, request: Omit<Request, "pid" | "version">,
-	options: { signal?: AbortSignal; ownerAlive: () => boolean; timeoutMs?: number },
+	options: { signal?: AbortSignal; ownerAlive: () => boolean | Promise<boolean>; timeoutMs?: number },
 ): Promise<void> {
 	if (options.signal?.aborted) throw new Error("Subagent message was aborted");
 	if (!request.text.trim()) throw new Error("Subagent message must not be blank");
-	if (!options.ownerAlive()) throw new Error("Subagent owner is no longer running");
+	const ownerAlive = async () => {
+		const alive = await abortable(Promise.resolve(options.ownerAlive()), options.signal);
+		if (options.signal?.aborted) throw new Error("Subagent message was aborted");
+		return alive;
+	};
+	if (!await ownerAlive()) throw new Error("Subagent owner is no longer running");
 	const dir = join(directory(agentDir, owner), `${Date.now()}-${randomUUID()}`);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	try {
 		writeFileSync(join(dir, "request.tmp"), JSON.stringify({ ...request, version: 1, pid: process.pid }), { mode: 0o600 });
-		renameReplacing(join(dir, "request.tmp"), join(dir, "request.json"));
+		await abortable(renameReplacingAsync(join(dir, "request.tmp"), join(dir, "request.json")), options.signal);
 		const deadline = Date.now() + (options.timeoutMs ?? 300_000);
 		while (true) {
 			if (options.signal?.aborted) throw new Error("Subagent message was aborted");
@@ -41,7 +60,10 @@ export async function requestOwnerMessage(
 				if (response.error) throw new Error(response.error);
 				return;
 			}
-			if (!options.ownerAlive()) throw new Error("Subagent owner is no longer running");
+			const alive = await ownerAlive();
+			// Admission may finish while the asynchronous owner lookup is in flight.
+			if (existsSync(join(dir, "response.json"))) continue;
+			if (!alive) throw new Error("Subagent owner is no longer running");
 			if (Date.now() >= deadline) throw new Error("Subagent owner message timed out");
 			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
@@ -104,7 +126,7 @@ export function startOwnerMessageConsumer(
 				try {
 					// Never recreate revoked directories or replay accepted prompts.
 					writeFileSync(join(dir, "response.tmp"), JSON.stringify({ error }), { mode: 0o600 });
-					renameReplacing(join(dir, "response.tmp"), join(dir, "response.json"));
+					await renameReplacingAsync(join(dir, "response.tmp"), join(dir, "response.json"));
 				} catch { /* Sender revoked the request. */ }
 			})().finally(() => {
 				clearInterval(monitor);

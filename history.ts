@@ -4,6 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "./types.ts";
+import { readConversationPageAsync } from "./session-reader.ts";
 
 type ConversationMessage = { id: string; role: "user" | "assistant"; text: string; continued?: boolean };
 
@@ -106,7 +107,36 @@ function decodeCursor(cursor: string, source: string): Position {
 	}
 }
 
+export type ConversationOptions = { cursor?: string; limit?: number; maxChars?: number };
+export type ConversationResult = { messages: ConversationMessage[]; nextCursor?: string; hasMore: boolean };
+
+function validateRecord(record: AgentRecord): asserts record is AgentRecord & { sessionFile: string; sessionId: string } {
+	if (!record.sessionFile) throw new Error("Child has no saved session file.");
+	if (!isAbsolute(record.sessionFile) || !record.sessionId || !isAbsolute(record.cwd)) {
+		throw new Error("Child session record needs an absolute session file/cwd and a session identity.");
+	}
+}
+
+function cursorSource(record: AgentRecord): string {
+	return createHash("sha256").update(JSON.stringify([record.sessionId, normalizedPath(record.sessionFile!), normalizedPath(record.cwd)])).digest("base64url");
+}
+
+/** Fully async interactive reader: bounded IO, off-thread parse, append-offset cache. */
+export async function readConversationAsync(record: AgentRecord, options: ConversationOptions = {}): Promise<ConversationResult> {
+	validateRecord(record);
+	const source = cursorSource(record);
+	const position = options.cursor === undefined ? { id: null, offset: 0 } : decodeCursor(options.cursor, source);
+	const page = await readConversationPageAsync(record.sessionFile, { sessionId: record.sessionId, cwd: record.cwd }, position,
+		bound(options.limit, 20, 100), bound(options.maxChars, 24000, 50000));
+	return {
+		messages: page.messages,
+		nextCursor: Buffer.from(JSON.stringify([1, source, page.position.id, page.position.offset])).toString("base64url"),
+		hasMore: page.hasMore,
+	};
+}
+
 /**
+ * Legacy synchronous compatibility API; interactive tools use readConversationAsync.
  * Read the complete active branch, including pre-compaction delegation. Output
  * contains only user/assistant text and image placeholders, never tool/thinking
  * payloads. continued means this chunk starts inside a previously read message.
@@ -117,21 +147,14 @@ function decodeCursor(cursor: string, source: string): Position {
  */
 export function readConversation(
 	record: AgentRecord,
-	options: { cursor?: string; limit?: number; maxChars?: number } = {},
-): {
-	messages: Array<{ id: string; role: "user" | "assistant"; text: string; continued?: boolean }>;
-	nextCursor?: string;
-	hasMore: boolean;
-} {
-	if (!record.sessionFile) throw new Error("Child has no saved session file.");
-	if (!isAbsolute(record.sessionFile) || !record.sessionId || !isAbsolute(record.cwd)) {
-		throw new Error("Child session record needs an absolute session file/cwd and a session identity.");
-	}
+	options: ConversationOptions = {},
+): ConversationResult {
+	validateRecord(record);
 	validateHeader(readHeader(record.sessionFile), record);
 	const session = SessionManager.open(record.sessionFile, undefined, record.cwd);
 	validateHeader(session.getHeader(), record);
 	const branch = session.getBranch();
-	const source = createHash("sha256").update(JSON.stringify([record.sessionId, normalizedPath(record.sessionFile), normalizedPath(record.cwd)])).digest("base64url");
+	const source = cursorSource(record);
 	let position: Position = options.cursor === undefined ? { id: null, offset: 0 } : decodeCursor(options.cursor, source);
 	const start = position.id === null ? 0 : branch.findIndex((entry) => entry.id === position.id);
 	if (start < 0) throw cursorError("entry is no longer on the active branch");

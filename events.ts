@@ -26,13 +26,64 @@ function addUsage(target: UsageSummary, usage: any): void {
 }
 
 function shortArgs(args: unknown): string {
-	let text: string;
-	try {
-		text = JSON.stringify(args ?? {});
-	} catch {
-		text = "{}";
-	}
-	return text.length <= 180 ? text : `${text.slice(0, 177)}…`;
+	// Bound work before serialization, not after a multi-megabyte stringify. Do
+	// not invoke toJSON/getters: this is a display preview, not tool execution.
+	let remaining = 177;
+	let visits = 32;
+	let truncated = false;
+	const parts: string[] = [];
+	const seen = new Set<object>();
+	const append = (text: string) => {
+		if (text.length > remaining) truncated = true;
+		parts.push(text.slice(0, remaining));
+		remaining = Math.max(0, remaining - text.length);
+	};
+	const quoted = (text: string, maximum = 120) => {
+		const limit = Math.min(maximum, remaining);
+		if (text.length > limit) truncated = true;
+		append(JSON.stringify(text.slice(0, limit)));
+	};
+	const visit = (value: unknown, depth: number): void => {
+		if (!remaining) { truncated = true; return; }
+		if (--visits < 0) { truncated = true; quoted("[…]"); return; }
+		if (typeof value === "string") { quoted(value); return; }
+		if (value === null || typeof value !== "object") {
+			append(typeof value === "bigint" ? '"[bigint]"' : JSON.stringify(value) ?? "null");
+			return;
+		}
+		if (seen.has(value)) { quoted("[Circular]"); return; }
+		if (depth >= 3) { truncated = true; quoted("[…]"); return; }
+		seen.add(value);
+		const array = Array.isArray(value);
+		append(array ? "[" : "{");
+		let count = 0;
+		// Object.keys() would allocate/scan every key before applying the bound.
+		if (array) {
+			for (let i = 0; i < Math.min(value.length, 8) && remaining; i++) {
+				if (count++) append(",");
+				const descriptor = Object.getOwnPropertyDescriptor(value, i);
+				visit(descriptor && "value" in descriptor ? descriptor.value : "[Getter]", depth + 1);
+			}
+			if (value.length > count) truncated = true;
+		} else {
+			let inspected = 0;
+			for (const key in value) {
+				if (++inspected > 8 || !remaining) { truncated = true; break; }
+				if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (!descriptor?.enumerable) continue;
+				if ("value" in descriptor && (descriptor.value === undefined || typeof descriptor.value === "function" || typeof descriptor.value === "symbol")) continue;
+				if (count++) append(",");
+				quoted(key, 40); append(":");
+				visit("value" in descriptor ? descriptor.value : "[Getter]", depth + 1);
+			}
+		}
+		append(array ? "]" : "}");
+		seen.delete(value);
+	};
+	try { visit(args ?? {}, 0); }
+	catch { return "{}"; }
+	return parts.join("") + (truncated ? "…" : "");
 }
 
 export interface ParsedChildState {
@@ -99,12 +150,12 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 			record.activity = event.isError ? `${event.toolName ?? "tool"} failed` : "thinking";
 			important = true;
 			break;
-		case "message_end":
-			if (event.message?.role === "user" || messageText(event.message)) {
+		case "message_end": {
+			const text = messageText(event.message);
+			if (event.message?.role === "user" || text) {
 				record.conversationRevision = (record.conversationRevision ?? 0) + 1;
 			}
 			if (event.message?.role === "assistant") {
-				const text = messageText(event.message);
 				if (text) {
 					state.finalText = text;
 					record.latestText = boundedTail(text);
@@ -117,6 +168,7 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 				important = true;
 			}
 			break;
+		}
 		case "agent_end":
 			record.status = "idle";
 			record.activity = "finishing";

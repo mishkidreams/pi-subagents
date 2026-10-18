@@ -1,9 +1,10 @@
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
+import { setTimeout as delay } from "node:timers/promises";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_SETTINGS, MODEL_CONFIG_ENV, serializeModelSettings, validateRpcMaxLineChars } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
@@ -23,9 +24,13 @@ import {
 	readProcessIdentity,
 	type ProcessIdentity,
 	readRecords,
+	readRecordsAsync,
+	readRecord,
+	readRecordAsync,
 	saveRecord,
 	saveRecordAsync,
 	withRecordLock,
+	withRecordLockAsync,
 } from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type ResultRoute, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
 
@@ -207,8 +212,35 @@ function launchPiCli(script: string, args: string[]): { command: string; args: s
  * Find the pi CLI without launching pi.cmd or an unrelated pi.exe/pi.js.
  * PATH wins over a stale global npm prefix. Nothing found returns undefined;
  * the caller falls back to spawn("pi") rather than throwing.
+ * Compatibility-only synchronous API; production launch/resume use windowsPiLaunchAsync.
  */
 export function windowsPiLaunch(args: string[]): { command: string; args: string[] } | undefined {
+	let listed = "";
+	try {
+		listed = execFileSync("where.exe", ["pi"], { encoding: "utf8", windowsHide: true, timeout: 2000 });
+	} catch {
+		listed = "";
+	}
+	return windowsPiLaunchFromListing(args, listed);
+}
+
+async function windowsPiLaunchAsync(args: string[], signal?: AbortSignal): Promise<{ command: string; args: string[] } | undefined> {
+	if (signal?.aborted) throw new Error("Subagent message was aborted");
+	let listed = "";
+	try {
+		listed = await new Promise<string>((resolveListed) => {
+			execFile("where.exe", ["pi"], { encoding: "utf8", windowsHide: true, timeout: 2000, signal }, (error, stdout) => {
+				resolveListed(error ? "" : stdout);
+			});
+		});
+	} catch {
+		// Missing/failed where.exe retains the npm-prefix and spawn("pi") fallbacks.
+	}
+	if (signal?.aborted) throw new Error("Subagent message was aborted");
+	return windowsPiLaunchFromListing(args, listed);
+}
+
+function windowsPiLaunchFromListing(args: string[], listed: string): { command: string; args: string[] } | undefined {
 	const fromTarget = (target: string): { command: string; args: string[] } | undefined => {
 		const lower = target.toLowerCase();
 		if (lower.endsWith(".js")) {
@@ -224,12 +256,6 @@ export function windowsPiLaunch(args: string[]): { command: string; args: string
 		const parsed = scriptFromShim(target);
 		return parsed ? launchPiCli(parsed, args) : undefined;
 	};
-	let listed = "";
-	try {
-		listed = execFileSync("where.exe", ["pi"], { encoding: "utf8", windowsHide: true, timeout: 2000 });
-	} catch {
-		listed = "";
-	}
 	for (const line of listed.split(/\r?\n/)) {
 		const target = line.trim();
 		if (!target || !existsSync(target)) continue;
@@ -248,7 +274,7 @@ export function windowsPiLaunch(args: string[]): { command: string; args: string
 	return undefined;
 }
 
-function resolvePiLaunch(): { command: string; leadingArgs: string[] } {
+async function resolvePiLaunch(signal?: AbortSignal): Promise<{ command: string; leadingArgs: string[] }> {
 	// Test hook: run a fake child instead of the real pi binary.
 	const override = process.env.PI_SUBAGENT_COMMAND;
 	if (override) return { command: process.execPath, leadingArgs: [override] };
@@ -260,7 +286,7 @@ function resolvePiLaunch(): { command: string; leadingArgs: string[] } {
 	}
 	// spawn("pi") cannot execute pi.cmd, and shell:true would parse the prompt as cmd syntax.
 	if (process.platform === "win32") {
-		const launch = windowsPiLaunch([]);
+		const launch = await windowsPiLaunchAsync([], signal);
 		if (launch) return { command: launch.command, leadingArgs: launch.args };
 		const host = basename(process.execPath).toLowerCase();
 		return /^(node|bun)(\.exe)?$/.test(host)
@@ -273,8 +299,8 @@ function resolvePiLaunch(): { command: string; leadingArgs: string[] } {
 		: { command: process.execPath, leadingArgs: [] };
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const launch = resolvePiLaunch();
+async function getPiInvocation(args: string[], signal?: AbortSignal): Promise<{ command: string; args: string[] }> {
+	const launch = await resolvePiLaunch(signal);
 	return { command: launch.command, args: [...launch.leadingArgs, ...args] };
 }
 
@@ -523,83 +549,110 @@ function ownChild(
 	return owned;
 }
 
-/** Force-cancel a running or queued child and all of its descendants. */
-export function cancelSubagent(agentDir: string, record: AgentRecord): AgentRecord {
-	const cancelOne = (item: AgentRecord): AgentRecord => {
-		let updated!: AgentRecord;
-		let pid: number | undefined;
-		let startTime: string | undefined;
-		let owned: OwnedChild | undefined;
-		const armStop = () => {
-			owned = owned ?? ownedChildren.get(item.runId);
-			runAbortControllers.get(item.runId)?.abort();
-			liveChildren.get(item.runId)?.abort();
-		};
-		try {
-			withRecordLock(agentDir, item.runId, () => {
-				const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
-				pid = latest.pid;
-				startTime = latest.pidStartTime;
-				const now = new Date().toISOString();
-				updated = saveRecord(agentDir, {
-					...latest,
-					status: "cancelled",
-					activity: "cancelled",
-					currentTool: undefined,
-					error: latest.error ?? "Cancelled",
-					finishedAt: latest.finishedAt ?? now,
-					updatedAt: now,
-				});
-				pid = updated.pid ?? pid;
-				startTime = updated.pidStartTime ?? startTime;
-				armStop();
-			});
-		} catch (error) {
-			// The marker is written before the JSON rename. A sharing violation must not
-			// leave the panel showing cancelled while the child keeps running.
-			if (!isRecordCancelled(agentDir, item.runId)) throw error;
-			armStop();
-			updated = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? {
-				...item,
+/** Cancel one execution without waiting synchronously for another registry writer. */
+function cancelOneSubagent(agentDir: string, item: AgentRecord): AgentRecord {
+	let updated!: AgentRecord;
+	let pid: number | undefined;
+	let startTime: string | undefined;
+	let owned: OwnedChild | undefined;
+	const armStop = () => {
+		owned = owned ?? ownedChildren.get(item.runId);
+		runAbortControllers.get(item.runId)?.abort();
+		liveChildren.get(item.runId)?.abort();
+	};
+	try {
+		withRecordLock(agentDir, item.runId, () => {
+			const latest = readRecord(agentDir, item.runId) ?? item;
+			pid = latest.pid;
+			startTime = latest.pidStartTime;
+			const now = new Date().toISOString();
+			updated = saveRecord(agentDir, {
+				...latest,
 				status: "cancelled",
 				activity: "cancelled",
 				currentTool: undefined,
-				error: item.error ?? "Cancelled",
-			};
-			pid = pid ?? updated.pid;
-			startTime = startTime ?? updated.pidStartTime;
-		}
-		if (owned) {
-			const termination = owned.terminate();
-			void termination.catch(() => {
-				// Cancel already persisted. Shutdown awaits this same promise and sees the failure.
-			});
-		} else if (pid && isProcessAlive(pid)) {
-			const runId = updated.runId;
-			const killStartTime = startTime ?? updated.pidStartTime;
-			const kill = killPidTree(pid, killStartTime).catch((error: unknown) => {
-				const message = error instanceof Error ? error.message : String(error);
-				try {
-					withRecordLock(agentDir, runId, () => {
-						const latest = readRecords(agentDir).find((candidate) => candidate.runId === runId);
-						if (!latest) return;
-						saveRecord(agentDir, {
-							...latest,
-							error: latest.error ? `${latest.error}; ${message}` : message,
-						});
-					});
-				} catch {
-					// The cancelled status is already on disk.
-				}
-			});
-			trackExternalKill(kill);
-		}
-		return updated;
-	};
-	for (const child of descendantsOf(readRecords(agentDir), record.runId).reverse()) {
-		if (!isTerminalStatus(child.status)) cancelOne(child);
+				error: latest.error ?? "Cancelled",
+				finishedAt: latest.finishedAt ?? now,
+				updatedAt: now,
+			}, { retryRename: false });
+			pid = updated.pid ?? pid;
+			startTime = updated.pidStartTime ?? startTime;
+			armStop();
+		}, 0);
+	} catch (error) {
+		// The marker is written before the JSON rename. A sharing violation must not
+		// leave the panel showing cancelled while the child keeps running.
+		if (!isRecordCancelled(agentDir, item.runId)) throw error;
+		armStop();
+		updated = readRecord(agentDir, item.runId) ?? {
+			...item,
+			status: "cancelled",
+			activity: "cancelled",
+			currentTool: undefined,
+			error: item.error ?? "Cancelled",
+		};
+		pid = pid ?? updated.pid;
+		startTime = startTime ?? updated.pidStartTime;
 	}
-	return cancelOne(record);
+	if (owned) {
+		const termination = owned.terminate();
+		void termination.catch(() => {
+			// Cancel already persisted. Shutdown awaits this same promise and sees the failure.
+		});
+	} else if (pid && isProcessAlive(pid)) {
+		const runId = updated.runId;
+		const killStartTime = startTime ?? updated.pidStartTime;
+		const kill = killPidTree(pid, killStartTime).catch(async (error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			try {
+				await withRecordLockAsync(agentDir, runId, () => {
+					const latest = readRecord(agentDir, runId);
+					if (!latest || latest.processInstanceId !== updated.processInstanceId) return;
+					saveRecord(agentDir, {
+						...latest,
+						error: latest.error ? `${latest.error}; ${message}` : message,
+					}, { retryRename: false });
+				});
+			} catch {
+				// The cancelled status is already on disk.
+			}
+		});
+		trackExternalKill(kill);
+	}
+	return updated;
+}
+
+/** Synchronous compatibility entry point: contention is retryable EBUSY, never a UI-thread wait. */
+export function cancelSubagent(agentDir: string, record: AgentRecord): AgentRecord {
+	for (const child of descendantsOf(readRecords(agentDir), record.runId).reverse()) {
+		if (!isTerminalStatus(child.status)) cancelOneSubagent(agentDir, child);
+	}
+	return cancelOneSubagent(agentDir, record);
+}
+
+async function cancelOneSubagentAsync(agentDir: string, record: AgentRecord): Promise<AgentRecord> {
+	const deadline = Date.now() + 5_000;
+	while (true) {
+		try {
+			return await withRecordLockAsync(agentDir, record.runId, () => cancelOneSubagent(agentDir, record), Math.max(0, deadline - Date.now()));
+		} catch (error) {
+			// Only retry a failed rename before cancellation was persisted/armed.
+			// This idempotent cancellation path is unlike launch: never replay a spawn callback.
+			if (!isTransientFsError(error) || (error as NodeJS.ErrnoException).syscall !== "rename" || Date.now() >= deadline) throw error;
+			await delay(25);
+		}
+	}
+}
+
+/** Await cancellation admission without blocking stdout, UI callbacks, or other cancellations. */
+export async function cancelSubagentAsync(agentDir: string, record: AgentRecord): Promise<AgentRecord> {
+	const children = descendantsOf(await readRecordsAsync(agentDir), record.runId).reverse();
+	for (const child of children) {
+		if (!isTerminalStatus(child.status)) {
+			await cancelOneSubagentAsync(agentDir, child);
+		}
+	}
+	return cancelOneSubagentAsync(agentDir, record);
 }
 
 /** Stop and await children owned by this process. Queued run loops also drain. */
@@ -665,7 +718,7 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		startedAt: now,
 		updatedAt: now,
 	};
-	Object.assign(record, saveRecord(context.agentDir, record));
+	Object.assign(record, await saveRecordAsync(context.agentDir, record, context.signal));
 	context.onRecord?.(record);
 
 	void launchRun(input, context, record).catch(() => {});
@@ -684,13 +737,31 @@ function waitForMessage(pending: Promise<void>, signal?: AbortSignal, canCancelW
 	});
 }
 
+async function claimRecordForResumeAsync(
+	agentDir: string, record: AgentRecord, resultRoute?: ResultRoute, signal?: AbortSignal,
+): Promise<AgentRecord> {
+	const deadline = Date.now() + 5_000;
+	while (true) {
+		try {
+			return await withRecordLockAsync(agentDir, record.runId,
+				() => claimRecordForResume(agentDir, record, resultRoute, { retryRename: false }),
+				Math.max(0, deadline - Date.now()), signal);
+		} catch (error) {
+			// Before the atomic claim succeeds, retrying archive/write is idempotent.
+			// A successful claim returns immediately; never replay the launch itself.
+			if (!isTransientFsError(error) || (error as NodeJS.ErrnoException).syscall !== "rename" || Date.now() >= deadline) throw error;
+			await delay(25, undefined, { signal });
+		}
+	}
+}
+
 /** Relaunch only an owned, exited child, opening the exact saved history. */
 export async function resumeSubagent(record: AgentRecord, message: string, context: SpawnContext): Promise<void> {
 	const pending = resumingChildren.get(record.runId);
 	if (pending) {
 		await waitForMessage(pending, context.signal);
 		if (await sendSubagentMessage(record, message, context.signal, context.resultRoute)) return;
-		const latest = readRecords(context.agentDir).find((item) => item.runId === record.runId);
+		const latest = await readRecordAsync(context.agentDir, record.runId);
 		if (!latest) throw new Error("Subagent record disappeared");
 		return resumeSubagent(latest, message, context);
 	}
@@ -700,7 +771,7 @@ export async function resumeSubagent(record: AgentRecord, message: string, conte
 		if (record.parentRunId !== context.parentRunId || record.rootRunId !== context.rootRunId) throw new Error("Subagent is not owned by this session");
 		if (record.pid && record.pidStartTime && process.platform === "win32") {
 			await probeWindowsStartTime(record.pid);
-			record = readRecords(context.agentDir).find((item) => item.runId === record.runId) ?? record;
+			record = await readRecordAsync(context.agentDir, record.runId) ?? record;
 		}
 		if (record.status === "cancelled") throw new Error(`${record.name} was cancelled`);
 		if (!isTerminalStatus(record.status) || isRecordedProcessAlive(record)) throw new Error(`${record.name} is still running`);
@@ -725,7 +796,7 @@ export async function resumeSubagent(record: AgentRecord, message: string, conte
 			}
 		} finally { await file.close(); }
 		if (context.signal?.aborted) throw new Error("Subagent message was aborted");
-		const next = claimRecordForResume(context.agentDir, record, context.resultRoute);
+		const next = await claimRecordForResumeAsync(context.agentDir, record, context.resultRoute, context.signal);
 		next.maxDepth = maxDepth;
 		next.model = savedModel.model;
 		next.thinking = savedModel.thinking;
@@ -775,6 +846,8 @@ async function runSubagentProcess(
 	onAccepted: () => void,
 	sessionFile?: string,
 ): Promise<void> {
+	// Capture before admission/locator I/O yields and the caller changes its environment.
+	const inheritedEnv = { ...process.env };
 	let release: (() => void) | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 	let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -909,24 +982,24 @@ async function runSubagentProcess(
 		);
 
 		let child: ChildProcessWithoutNullStreams | undefined;
-		// where.exe can take seconds. Resolve it before the record lock so cancel can still get in.
-		const piLaunch = resolvePiLaunch();
-		withRecordLock(context.agentDir, record.runId, () => {
+		// where.exe can take seconds. Await it outside the lock so timers and cancellation keep working.
+		const invocation = await getPiInvocation(args, runSignal);
+		await withRecordLockAsync(context.agentDir, record.runId, () => {
+			if (runSignal.aborted) throw new Error("Subagent message was aborted");
 			if (diskCancelled()) return;
 			// Re-resolve immediately before spawn so a swapped symlink cannot keep --approve.
 			record.cwd = ensureDirectory(record.cwd);
 			const trustedRoot = ensureDirectory(context.parentCwd);
 			if (context.projectTrusted && isWithinDirectory(record.cwd, trustedRoot)) {
-				args.push("--approve");
+				invocation.args.push("--approve");
 			}
-			const invocation = { command: piLaunch.command, args: [...piLaunch.leadingArgs, ...args] };
 			child = spawn(invocation.command, invocation.args, {
 				cwd: record.cwd,
 				detached: process.platform !== "win32",
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
 				env: {
-					...process.env,
+					...inheritedEnv,
 					PI_SUBAGENT_RUN_ID: record.runId,
 					PI_SUBAGENT_PARENT_ID: context.parentRunId,
 					PI_SUBAGENT_ROOT_ID: context.rootRunId,
@@ -944,7 +1017,7 @@ async function runSubagentProcess(
 			record.status = "starting";
 			record.activity = "starting";
 			publish();
-		});
+		}, undefined, runSignal);
 		if (!child) return;
 		const launchedChild = child;
 
@@ -1182,7 +1255,7 @@ async function runSubagentProcess(
 			if (event.type === "agent_settled") {
 				if (initialSettled) continuationReleases.shift()?.();
 				if (record.status === "cancelled" || diskCancelled()) {
-					const onDisk = readRecords(context.agentDir).find((r) => r.runId === record.runId);
+					const onDisk = readRecord(context.agentDir, record.runId);
 					if (onDisk) Object.assign(record, onDisk);
 				} else if (state.stopReason === "aborted") {
 					settle("cancelled", "Subagent was aborted");
@@ -1246,7 +1319,7 @@ async function runSubagentProcess(
 			rejectPending(exitError);
 			const wasCancelled = record.status === "cancelled" || diskCancelled();
 			if (wasCancelled) {
-				const onDisk = readRecords(context.agentDir).find((candidate) => candidate.runId === record.runId);
+				const onDisk = readRecord(context.agentDir, record.runId);
 				if (onDisk) Object.assign(record, onDisk);
 			}
 			let newlySettled = false;

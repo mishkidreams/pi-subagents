@@ -43,6 +43,7 @@ const theme = { fg: (_c, text) => String(text), bg: (_c, text) => String(text), 
       if (messagePending) await messagePending;
       if (messageFailure) throw new Error('PUBLIC_PATH_SEND_FAILURE');
     } });
+    await panel.ready();
     const open = () => { assert.equal(panel.openReview(), true); ui.handleTerminalInput('\x1b[C'); return frame(); };
     const click = text => {
       const screen = frame(), y = screen.findIndex(line => line.includes(text));
@@ -111,6 +112,7 @@ const theme = { fg: (_c, text) => String(text), bg: (_c, text) => String(text), 
     for (const cwd of [os.homedir(), os.homedir().replaceAll('\\', '/') + '/S01-public-fixture', os.homedir() + '-other/S01-public-fixture']) {
       ui.handleTerminalInput('\x1b'); frame();
       registry.saveRecord(sandbox, { ...record, cwd });
+      await panel.ready();
       const screen = open();
       assert.equal(screen.some(line => line.includes('~')), !cwd.includes('-other/'), 'home abbreviation respects separator variants and the directory boundary');
     }
