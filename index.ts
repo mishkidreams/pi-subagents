@@ -16,6 +16,7 @@ import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { requestOwnerMessage, startOwnerMessageConsumer } from "./owner-control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { readConversation } from "./history.ts";
+import { formatModelCatalog, validateModelConfiguration, type ModelSelectionContext } from "./model-selection.ts";
 import { isProcessAlive, isTerminalStatus, markRecordResultState, readParentResults, readRecords, resultKey } from "./registry.ts";
 import { notifyWaiters, waitForSubagentResult, waitUntilSubagentsIdle } from "./wait.ts";
 import {
@@ -80,9 +81,9 @@ const SpawnAgentSchema = Type.Object({
 	task: Type.String({ description: "Focused task to delegate to the subagent" }),
 	name: Type.Optional(Type.String({ description: "Readable subagent name" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory, relative to the current agent unless absolute" })),
-	model: Type.Optional(Type.String({ description: "Exact model selector. Overrides configured and inherited defaults." })),
+	model: Type.Optional(Type.String({ description: "Configured model alias or exact provider/model ID. With aliasesOnly: true, only an enabled alias is allowed. Omit to use defaultModel, or inherit the parent model only when aliasesOnly is false. No @ prefix." })),
 	thinking: Type.Optional(
-		Type.String({ description: "Thinking level for this subagent", enum: [...THINKING_LEVEL_VALUES] }),
+		Type.String({ description: "Thinking level override; omit to use the alias thinking, session model pin, configured default, or parent thinking. Must match any session model pin.", enum: [...THINKING_LEVEL_VALUES] }),
 	),
 	tools: Type.Optional(Type.Array(Type.String(), { description: "Exact subset of the creating session's active tools; omit to inherit all active tools" })),
 });
@@ -115,6 +116,13 @@ function shortId(runId: string): string {
 
 export default function subagentsExtension(pi: ExtensionAPI) {
 	let runtime: RuntimeState | undefined;
+	let initializationError: string | undefined;
+	const configurationError = (error: unknown): string =>
+		`${error instanceof Error ? error.message : String(error)}\nFix subagents.json or the session model scope/registry, then /reload to retry.`;
+	const unavailableMessage = (): string => initializationError ?? "Subagents are not initialized. Use /reload to retry.";
+	const unavailableResult = () => ({
+		content: [{ type: "text" as const, text: unavailableMessage() }], details: undefined, isError: true,
+	});
 	let sessionContext: ExtensionContext | undefined;
 	let panel: SubagentPanel | undefined;
 	let mainModel: string | undefined;
@@ -322,6 +330,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		initializationError = undefined;
 		sessionContext = ctx;
 		shuttingDown = false;
 		agentActive = false;
@@ -345,9 +354,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				}),
 				projectTrusted: ctx.isProjectTrusted(),
 			};
+			// A leaf (or a session without delegation tools) must still run its own
+			// task when aliases are inaccessible from its narrower model scope.
+			if (runtime.depth < runtime.settings.maxDepth && canDelegate()) {
+				validateModelConfiguration(modelSelectionContext(ctx));
+			}
 		} catch (error) {
 			runtime = undefined;
-			if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			initializationError = configurationError(error);
+			if (ctx.hasUI) ctx.ui.notify(initializationError, "error");
 		}
 
 		if (!runtime) return;
@@ -412,14 +427,53 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return new Markdown(text, 1, 0, getMarkdownTheme());
 	});
 
+	const modelSelectionContext = (ctx: ExtensionContext): ModelSelectionContext => {
+		if (!runtime) throw new Error(unavailableMessage());
+		return {
+			settings: runtime.settings,
+			parentModel: modelLabel(ctx), parentThinking: ctx.thinkingLevel ?? "off",
+			scopedModels: (ctx.scopedModels ?? []).map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
+			availableModels: ctx.modelRegistry?.getAvailable?.().map(({ provider, id }) => ({ provider, id })),
+		};
+	};
+
+	const canDelegate = (): boolean => {
+		const active = pi.getActiveTools();
+		// Codemode can hide a declaration without removing the tool from the active set.
+		if (active.includes("spawn_agent")) return true;
+		const tools = pi.getAllTools?.() ?? [];
+		const exposure = tools.find((tool) => tool.name === "spawn_agent")?.exposure;
+		return (exposure === "codemode" || exposure === "deferred") &&
+			tools.some((tool) => active.includes(tool.name) && tool.exposure !== "hidden" && !!tool.reachesTools);
+	};
+
+	pi.on("before_agent_start", (event, ctx) => {
+		let catalog = "";
+		if (canDelegate()) {
+			if (!runtime) {
+				if (initializationError) catalog = `Subagent delegation unavailable (configuration error): ${initializationError}`;
+			} else if (runtime.depth < runtime.settings.maxDepth) {
+				try {
+					const context = modelSelectionContext(ctx);
+					validateModelConfiguration(context);
+					catalog = formatModelCatalog(context);
+				} catch (error) {
+					// Model scopes and registries can change between turns. Describe the
+					// current failure without throwing or poisoning the valid runtime.
+					catalog = `Subagent delegation unavailable (configuration error): ${configurationError(error)}`;
+				}
+			}
+		}
+		if (catalog) event.systemPromptOptions.sections.subagent_models = catalog;
+		else delete event.systemPromptOptions.sections.subagent_models;
+	});
+
 	const spawnContext = (ctx: ExtensionContext, signal?: AbortSignal): SpawnContext => {
-		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		if (!runtime) throw new Error(unavailableMessage());
 		return {
 			agentDir: getAgentDir(), parentRunId: runtime.runId, rootRunId: runtime.rootRunId,
-			currentDepth: runtime.depth, settings: runtime.settings,
-			parentModel: modelLabel(ctx), parentThinking: ctx.thinkingLevel ?? "off",
+			currentDepth: runtime.depth, ...modelSelectionContext(ctx),
 			parentTools: pi.getActiveTools(),
-			scopedModels: ctx.scopedModels.map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
 			parentCwd: ctx.cwd, projectTrusted: runtime.projectTrusted,
 			persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc", signal,
 			onRecord: trackChild, onSettled: notifyChild,
@@ -458,13 +512,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const resolveRecord = (target: string): AgentRecord => {
-		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		if (!runtime) throw new Error(unavailableMessage());
 		const rows = descendantsOf(readRecords(getAgentDir()), runtime.runId);
 		return resolveAgentRecord(rows, target);
 	};
 
 	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal, resultRoute: ResultRoute = "parent"): Promise<void> => {
-		if (!runtime || !sessionContext || shuttingDown) throw new Error("Subagent extension settings failed to initialize");
+		if (!runtime || !sessionContext) throw new Error(unavailableMessage());
+		if (shuttingDown) throw new Error("Subagent session is shutting down; reload before sending another message");
 		if (!text.trim()) throw new Error("Subagent message must not be blank");
 		signal = signal ? AbortSignal.any([signal, sessionAbort.signal]) : sessionAbort.signal;
 		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
@@ -567,7 +622,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		description:
-			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work. Finished results arrive automatically as a tool-output preview or one idle batch; call check_subagents only when you need them now.",
+			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model only when aliasesOnly is false. With aliasesOnly: true, model must be an enabled alias (required when no defaultModel is configured). Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work. Finished results arrive automatically as a tool-output preview or one idle batch; call check_subagents only when you need them now.",
 		promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
 		promptGuidelines: [
 			"spawn_agent returns immediately; the child keeps running while you continue other work.",
@@ -576,7 +631,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		],
 		parameters: SpawnAgentSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+			if (!runtime) return unavailableResult();
 			sessionContext = ctx;
 			const record = await startSubagent(
 				{
@@ -630,7 +685,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		],
 		parameters: CheckSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+			if (!runtime) return unavailableResult();
 			const agentDir = getAgentDir();
 			const snapshot = () => descendantsOf(readRecords(agentDir), runtime!.runId);
 			const hasFresh = (_rows: readonly AgentRecord[]) => pendingDirectResults(true).length > 0;
@@ -725,6 +780,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Read new or historical subagent conversation on request",
 		parameters: ReadConversationSchema,
 		async execute(_toolCallId, params) {
+			if (!runtime) return unavailableResult();
 			const record = resolveRecord(params.target);
 			if (params.fromStart && params.cursor !== undefined) throw new Error("Use either fromStart or cursor, not both");
 			const automatic = params.cursor === undefined;
@@ -755,6 +811,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Steer a background subagent or continue its saved session",
 		parameters: SendSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (!runtime) return unavailableResult();
 			sessionContext = ctx;
 			const record = resolveRecord(params.target);
 			await sendToRecord(record, params.message, signal);
@@ -772,6 +829,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		promptSnippet: "Stop a running background subagent",
 		parameters: CancelSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (!runtime) return unavailableResult();
 			const agentDir = getAgentDir();
 			const record = resolveRecord(params.target);
 			if (isTerminalStatus(record.status)) {

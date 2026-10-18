@@ -30,6 +30,7 @@ if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
 		JSON.stringify({
 			PI_SUBAGENT_MAX_DEPTH: process.env.PI_SUBAGENT_MAX_DEPTH,
 			PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: process.env.PI_SUBAGENT_DEPTH_FLAG_OVERRIDE,
+			PI_SUBAGENT_MODEL_CONFIG: process.env.PI_SUBAGENT_MODEL_CONFIG,
 		}),
 	);
 }
@@ -52,8 +53,8 @@ function run(message, kind = "prompt") {
 				role: "assistant",
 				content: [{ type: "text", text: output }],
 				api: "fake",
-				provider: "fake",
-				model: "fake-model",
+				provider: process.env.FAKE_PROVIDER ?? "fake",
+				model: process.env.FAKE_MODEL ?? "fake-model",
 				usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 } },
 				stopReason: exitCode === 0 ? "stop" : "error",
 				...(exitCode === 0 ? {} : { errorMessage: "fake failure" }),

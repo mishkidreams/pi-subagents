@@ -66,11 +66,23 @@ export interface AgentRecord {
 	finishedAt?: string;
 }
 
+export interface ModelAlias {
+	/** Exact provider/model selector; never another alias. */
+	model: string;
+	/** Omitted means enabled. False hides and disables this alias, not the underlying model. */
+	enabled?: boolean;
+	thinking?: string;
+	description?: string;
+}
+
 export interface SubagentSettings {
 	/** Runtime provenance: a depth flag overrides file limits throughout its subtree. */
 	maxDepthFlagOverride?: boolean;
 	defaultModel?: string;
 	defaultThinking?: string;
+	modelAliases?: Record<string, ModelAlias>;
+	/** Only enabled aliases may launch children; saved canonical targets must remain allowlisted. */
+	aliasesOnly?: boolean;
 	maxDepth: number;
 	maxConcurrency: number;
 	/** Maximum UTF-16 code units per child RPC stdout record (default 64 Mi). */

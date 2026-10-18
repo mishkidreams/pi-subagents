@@ -10,6 +10,7 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 
 - **Asynchronous spawning** — `spawn_agent` returns immediately while the child runs in its own Pi process and session.
 - **Recursive delegation** — children can create grandchildren within the configured depth budget.
+- **Model aliases** — configure named model/thinking presets, with eligible aliases exposed to delegating agents.
 - **Parallel work** — concurrency is configurable, including unlimited mode with `maxConcurrency: -1`.
 - **Live monitoring** — the footer shows a recursive status tree with provider/model, activity, and elapsed time.
 - **Interactive transcripts** — open any child to read its complete Pi session from the original delegation prompt, including messages and tool calls.
@@ -21,7 +22,7 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 
 ## Install
 
-**Fork-only viewer:** the fullscreen transcript UI described here is on [`mishkidreams/pi-subagents`, `main`](https://github.com/mishkidreams/pi-subagents/tree/main). Use that fork's checkout to keep it; the inherited npm/upstream installation commands below do not include these changes. This UI was tested with official Pi **1.3.0** on Windows, without a Pi/core build; compatibility of the new viewer with older Pi versions has not been revalidated.
+**Fork-only additions:** use this fork's checkout containing the desired changes for the fullscreen transcript UI and model-alias configuration described here; the inherited npm/upstream installation commands below do not include them. The integration branch is [`mishkidreams/pi-subagents`, `main`](https://github.com/mishkidreams/pi-subagents/tree/main); local commits must be pushed before a fresh GitHub clone contains them. These additions were tested with official Pi **1.3.0** on Windows, without a Pi/core build; compatibility with older Pi versions has not been revalidated.
 
 Install from npm with Pi:
 
@@ -85,17 +86,21 @@ spawn_agent({
 })
 ```
 
-Optional fields are `name`, `cwd`, `model`, `thinking`, and an exact `tools` allowlist. Model selection is resolved as:
+Optional fields are `name`, `cwd`, `model`, `thinking`, and an exact `tools` allowlist. The `model` field accepts a configured alias without an `@` prefix (for example, `spawn_agent({ task: "Review the tests", model: "var1" })`) or a model selector. Model selection is resolved as:
 
 1. Per-spawn `model`
-2. `defaultModel` in configuration
-3. The creating agent's active model
+2. `defaultModel` in configuration (which may also be an alias)
+3. The creating agent's active model, only when `aliasesOnly` is `false` (the default)
 
-When the creating session has a model scope from Pi's `--models` flag or `enabledModels` setting, the selected child model must be in that scope. The scope and its pinned thinking levels are passed to the child. A pin is applied as the child's `--thinking` value; an explicit `thinking` that disagrees with the pin is rejected. An empty scope keeps Pi's unrestricted model behavior.
+With `aliasesOnly: true`, only enabled alias names are accepted for new children. Raw `provider/model` and bare model IDs are rejected, even if they point to an enabled alias's model. `defaultModel`, if set, must also be an enabled alias; without one, every spawn must provide an explicit alias. There is no fallback to the parent's model. Saved sessions may resume only while their exact canonical model remains the target of at least one enabled alias; an alias rename is fine, but disabling/removing the last alias for that model blocks resume without retargeting it.
+
+With the default `aliasesOnly: false`, aliases are conveniences, not an allowlist: full `provider/model` selectors and unambiguous exact bare model IDs (including IDs containing slashes) remain available within the creating session's current scope. Substring/fuzzy selectors are not resolved by this extension. Alias targets and canonical saved identities are always exact; they cannot retarget to another provider's bare ID. An enabled alias colliding with a legacy bare model ID is rejected rather than guessed; dormant disabled aliases are exempt. An unavailable configured model fails explicitly; it does not silently fall back to the parent model.
+
+When the creating session has a model scope from Pi's `--models` flag or `enabledModels` setting, the selected child model must be in that resolved scope and available in Pi's model registry. The scope and its pinned thinking levels are passed to the child. Pins are authoritative: a conflicting thinking request is rejected rather than overriding the pin. An empty scope imposes no additional restriction beyond model registry availability.
 
 Omitting `tools` copies the creating session's active tool set. An explicit list can only remove tools from that set, and `tools: []` starts the child with `--no-tools`. Include `spawn_agent` to allow recursive delegation. A child receives it automatically only when `spawn_agent` is active in the parent and `tools` is omitted or explicitly includes it.
 
-Thinking level follows the same precedence and is clamped to the selected child model.
+Thinking selection is explicit `thinking` > selected alias's `thinking` > configured `defaultThinking` > the creating agent's thinking level, subject to Pi's scope pins and the selected model's supported levels.
 
 ### `check_subagents`
 
@@ -135,7 +140,7 @@ Steer a running child or continue its completed session by exact name, run ID, u
 send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh path." })
 ```
 
-A completed or failed **direct child** can also be resumed after its process exited or the parent reloaded. This opens its exact saved session file and sends only the new message, retaining the child/run identity and history. Missing/mismatched history is an error, not a new empty conversation. Current model scope, tool permissions, trust and depth limits still apply; a removed capability is reported instead of silently restored. Cancelled children are not restarted. A deeper descendant must still have a live creating session to admit its request; ancestors do not silently adopt it.
+A completed or failed **direct child** can also be resumed after its process exited or the parent reloaded. This opens its exact saved session file and sends only the new message, retaining the child/run identity and history. The resolved canonical model and thinking level are saved; changing an alias later does not retarget a resumed child. Missing/mismatched history is an error, not a new empty conversation. Current model scope, tool permissions, trust and depth limits still apply; a removed capability is reported instead of silently restored. Cancelled children are not restarted. A deeper descendant must still have a live creating session to admit its request; ancestors do not silently adopt it.
 
 New process instances have separate close markers and reject stale registry writes, so an old process cannot clear the resumed PID. Duplicate sends during startup share one process; each distinct message is still delivered. Send success means RPC acceptance (or retention for an already queued startup), not completion of the model turn. Cancelling the sender's wait cannot erase late acceptance or its parent-directed result; accepted commands keep their ordering and concurrency accounting. The live continuation admission write retries transient Windows rename failures asynchronously, without blocking handle-close callbacks; unrelated errors and registry-writer contention still fail explicitly.
 
@@ -163,24 +168,53 @@ This replaces the previous behavior of queueing a separate follow-up prompt for 
 
 ## Configuration
 
-Global settings live at `~/.pi/agent/subagents.json`. A trusted project's `<configDir>/subagents.json` (`.pi` by default; Pi's `CONFIG_DIR_NAME`) can override them for that project.
+Global settings live at `<agentDir>/subagents.json` (`~/.pi/agent/subagents.json` by default). A trusted project's `cwd/.pi/subagents.json` can override them for that project (`.pi` follows Pi's `CONFIG_DIR_NAME`). Untrusted project configuration is not loaded.
 
 ```json
 {
-  "defaultModel": "anthropic/claude-sonnet-4-5",
+  "modelAliases": {
+    "var1": {
+      "model": "example-provider/example-model",
+      "enabled": true,
+      "thinking": "medium",
+      "description": "General review preset"
+    },
+    "var2": {
+      "model": "example-provider/example-model",
+      "enabled": false,
+      "thinking": "high",
+      "description": "Detailed review preset"
+    }
+  },
+  "defaultModel": "var1",
+  "aliasesOnly": true,
   "defaultThinking": "medium",
   "maxDepth": 4,
   "maxConcurrency": -1
 }
 ```
 
-All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
+`example-provider/example-model` is a fictional placeholder: replace it with an exact `provider/model` ID available in your Pi installation and current model scope. Multiple aliases may target the same model with different thinking levels.
 
-- `defaultModel` — fallback model for spawns that omit `model`.
-- `defaultThinking` — fallback thinking level for spawns that omit `thinking`.
+All fields are optional. Defaults are `maxDepth: 2`, `maxConcurrency: 4`, and `aliasesOnly: false`. Unknown configuration fields are rejected (for example, use `aliasesOnly`, not `aliasOnly`), so a typo cannot silently disable a guard.
+
+- `modelAliases` — map of alias names to objects with required `model` (an exact `provider/model` selector), optional `enabled` (boolean, defaults to `true`), optional `thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`), and optional `description` (any string). Alias names start with a letter or digit and contain only letters, digits, hyphens and underscores. String shorthand values are not accepted. Descriptions are literal user-provided text, not built-in cost or routing policy.
+- `aliasesOnly` — optional boolean hard guard for this extension: new children must select an enabled alias, and resumes require an exact enabled target. Requires at least one enabled alias; `defaultModel` may be omitted, but cannot be a raw model ID. Does not constrain Pi's main model, other extensions, or arbitrary processes, and is not a provider/account spending limit.
+- `defaultModel` — fallback model selector or alias for spawns that omit `model`; only an enabled alias is accepted when `aliasesOnly` is `true`.
+- `defaultThinking` — fallback thinking level when neither the spawn nor its selected alias supplies one.
 - `maxDepth` — maximum recursive depth. The root is depth `0`; `maxDepth: 0` disables spawning. Descendants inherit the root limit and may only tighten it.
 - `maxConcurrency` — number of children allowed to run at once per creating session. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically. Resuming a completed child also waits for its creator's slot, even when an ancestor sends the follow-up. Steering a running child does not require another slot.
 - `rpcMaxLineChars` — defensive limit per child stdout JSONL record, default `67108864` (64 Mi UTF-16 code units, including an optional trailing CR but excluding LF). Must be a positive safe integer; there is no unlimited mode. Set it in global or trusted-project `subagents.json`, for example `"rpcMaxLineChars": 134217728` for unusually large workloads.
+
+A trusted project's `modelAliases` replaces the entire global alias map; it does not merge individual entries. Use `"modelAliases": {}` to clear inherited global aliases when `aliasesOnly` is `false`; strict mode requires at least one enabled alias. Like other root settings, a trusted project's `aliasesOnly` can override the global setting. Children inherit a frozen snapshot of the effective aliases, `aliasesOnly` and delegation defaults, even if their `cwd` changes; they do not reload those settings from another project's files. Root sessions still load configuration from the locations above. The internal `PI_SUBAGENT_MODEL_CONFIG` environment variable carries this snapshot automatically; it is not a user configuration interface.
+
+Set `"enabled": false` inside an alias to keep its model, thinking and description as a saved preset without exposing or selecting it. Disabled aliases are omitted from the prompt catalog and available-alias suggestions. Selecting one by name, including through `defaultModel`, fails explicitly without a fallback or child launch. Boolean values are required (`"false"` is not accepted); structural validation still applies to disabled entries, but their model need not currently be available. The flag is inherited in the same frozen snapshot as the rest of the alias. Restart or `/reload` the root session after configuration changes.
+
+With `aliasesOnly: false`, `enabled` disables the alias, not the underlying model: an otherwise allowed canonical ID or another enabled alias may still select it, and saved sessions remain resumable. With `aliasesOnly: true`, disabling the last alias targeting a saved model also blocks resume. Already running children are not cancelled by editing configuration. Current model availability, scope and other resume checks always apply.
+
+At startup, structural/type errors identify the configuration file and field; disabled defaults and strict-mode defaults that are not aliases are rejected. Delegating sessions also validate alias-name collisions and the configured default against the current registry/scope/pins. Strict mode validates every enabled alias; disable unavailable presets explicitly. Errors identify the alias/model and reason, explain how to fix them, and remain available as tool errors if initialization failed. Model-selection tool errors include available aliases where applicable and never launch a fallback model. Registry/scope changes between turns render a safe configuration-error section rather than crashing prompt construction; restoring the session capabilities restores the catalog. Boundary-depth and tool-disabled sessions skip delegation capability checks. After editing files, use `/reload` or restart.
+
+Delegating agents receive one short, stable structured system section listing eligible aliases with their model, thinking level, literal descriptions, and current default. Eligibility intersects Pi's model registry availability with the current resolved model scope. The section is present only when the agent can delegate and is below its depth limit, including codemode-only sessions; it is not repeated as conversation messages and adds no built-in model cost or routing advice.
 
 Pi RPC embeds base64 images in tool/message events and aggregates messages in `turn_end` and `agent_end`. The 64 Mi default allows several multi-megabyte images and aggregate results that exceed ordinary text-output limits; it is a client safety bound, not a Pi protocol maximum. Both terminated and unterminated records exceeding it fail the child with an explicit error. Input is checked before buffering, scanned incrementally, and discarded on failure. Memory remains proportional to the configured bound (UTF-16 storage, joining, and JSON parsing can require several times the record size per concurrent child); raise it cautiously or reduce concurrency. LF-only framing and split UTF-8 decoding are preserved.
 
@@ -214,6 +248,8 @@ The extension is plain TypeScript loaded directly by Pi. The regression suite us
 
 ```sh
 node subagents.test.cjs
+node model-selection.test.cjs
+node model-prompt.test.cjs
 node continuation.test.cjs
 node history.test.cjs
 node routing.test.cjs
@@ -229,6 +265,8 @@ node panel-performance.test.cjs
 
 `panel-view.test.cjs` uses the installed Pi's real in-memory fullscreen renderer and native mouse/key dispatch, with synthetic sessions and no real agents, API calls, OS terminal or clipboard. Set `PI_ROOT` to the installed Pi package when needed. It checks coverage, pinned controls, scrolling, append/follow behavior, resizing, drafts, send failures and safe return. The fullscreen UI was tested against Pi 1.3.0 on Windows; this is not a claim of display virtualization or physical-terminal validation.
 
+`model-selection.test.cjs` covers alias configuration, precedence, availability/scope intersection, thinking pins, canonical offline RPC launch, inherited model settings, strict alias-only raw/fallback rejection, startup validation and saved-model allowlist checks. `model-prompt.test.cjs` exercises the actual structured system-prompt hook, including delegating children, depth/tool limits, codemode-only exposure and literal descriptions; it forbids network and child-process calls.
+
 `continuation.test.cjs` exercises the actual extension tool and RPC lifecycle with an offline Node fixture. It covers exited-session resume, repeated/concurrent messages, stale writers/close markers, concurrency admission/abort/retry, RPC rejection and capability/history boundaries. Process identity probes are stubbed; only owned fixtures may launch or be terminated. This is not a provider-backed live acceptance test.
 
 `history.test.cjs` uses the installed Pi's real `SessionManager` against synthetic JSONL and forbids network, providers and process launches. It covers both sides, compaction, active branches, lossless pagination, delta cursors and invalid/mismatched histories. `routing.test.cjs` uses the actual extension with an offline owned RPC fixture to distinguish quiet manual chat from delegated delivery, previews, idle wakeups, saved read cursors and cross-owner routing; it does not claim physical-terminal or provider-backed acceptance.
@@ -240,7 +278,8 @@ node panel-performance.test.cjs
 Source files are organized by responsibility:
 
 - `index.ts` — Pi registration, lifecycle hooks, tools, delivery, and UI wiring
-- `config.ts` — settings validation and precedence
+- `config.ts` — settings validation, precedence and inherited model snapshots
+- `model-selection.ts` — shared model/alias resolution, capability validation and factual prompt catalog
 - `registry.ts` — atomic run records and the latest pending delegated result per child
 - `history.ts` — bounded read-only conversation inspection and active-branch cursors
 - `wait.ts` — event-driven wait for descendant completion (`check_subagents` wait:true)

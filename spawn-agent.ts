@@ -5,8 +5,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_SETTINGS, validateRpcMaxLineChars, validateThinkingLevel } from "./config.ts";
+import { DEFAULT_SETTINGS, MODEL_CONFIG_ENV, serializeModelSettings, validateRpcMaxLineChars } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
+import { resolveModelSelection, resolveSavedModelSelection, type ModelCapability } from "./model-selection.ts";
+export { resolveChildModel } from "./model-selection.ts";
 import {
 	clearRecordPid,
 	claimRecordForResume,
@@ -141,11 +143,7 @@ export async function sendSubagentMessage(record: AgentRecord, message: string, 
 	return true;
 }
 
-export interface ScopedModelCapability {
-	provider: string;
-	id: string;
-	thinkingLevel?: string;
-}
+export type ScopedModelCapability = ModelCapability;
 
 export interface SpawnContext {
 	agentDir: string;
@@ -157,6 +155,7 @@ export interface SpawnContext {
 	parentThinking?: string;
 	parentTools: readonly string[];
 	scopedModels: readonly ScopedModelCapability[];
+	availableModels?: readonly ModelCapability[];
 	parentCwd: string;
 	projectTrusted: boolean;
 	persistAfterSettled?: boolean;
@@ -356,41 +355,6 @@ export function resolveChildTools(requested: readonly string[] | undefined, pare
 
 function canonicalModel(model: ScopedModelCapability): string {
 	return `${model.provider}/${model.id}`;
-}
-
-/** Canonicalize a requested model against a nonempty parent model scope. */
-export function resolveChildModel(model: string, scopedModels: readonly ScopedModelCapability[]): string {
-	if (scopedModels.length === 0) return model;
-	const normalized = model.toLowerCase();
-	const exact = scopedModels.find((item) => canonicalModel(item).toLowerCase() === normalized);
-	if (exact) return canonicalModel(exact);
-	const bareMatches = scopedModels.filter((item) => item.id.toLowerCase() === normalized);
-	if (bareMatches.length === 1) return canonicalModel(bareMatches[0]!);
-	if (bareMatches.length > 1) {
-		throw new Error(`Subagent model "${model}" is ambiguous within the creating session's model scope`);
-	}
-	throw new Error(`Subagent model "${model}" is outside the creating session's model scope`);
-}
-
-function scopedPin(model: string, scopedModels: readonly ScopedModelCapability[]): string | undefined {
-	return scopedModels.find((item) => canonicalModel(item).toLowerCase() === model.toLowerCase())?.thinkingLevel;
-}
-
-function resolveChildThinking(
-	requested: string | undefined,
-	model: string,
-	scopedModels: readonly ScopedModelCapability[],
-	fallback: string,
-): string {
-	const pinned = scopedPin(model, scopedModels);
-	const value = requested?.trim();
-	if (value) {
-		if (pinned && value !== pinned) {
-			throw new Error(`Subagent thinking "${value}" is outside the creating session's pin for ${model} (${pinned})`);
-		}
-		return value;
-	}
-	return pinned || fallback;
 }
 
 function scopedModelArgs(scopedModels: readonly ScopedModelCapability[]): string[] {
@@ -677,22 +641,9 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 	const runId = randomUUID();
 	const parentCwd = ensureDirectory(context.parentCwd);
 	const cwd = ensureDirectory(input.cwd ? resolve(parentCwd, input.cwd) : parentCwd);
-	const selectedModel = input.model?.trim() || context.settings.defaultModel || context.parentModel;
-	if (!selectedModel) {
-		throw new Error("No subagent model is available; choose a parent model or configure defaultModel");
-	}
-	const model = resolveChildModel(selectedModel, context.scopedModels);
+	const { model, thinking } = resolveModelSelection(input.model, input.thinking, context);
 	const tools = resolveChildTools(input.tools, context.parentTools);
 	scopedModelArgs(context.scopedModels);
-	const thinking = validateThinkingLevel(
-		resolveChildThinking(
-			input.thinking,
-			model,
-			context.scopedModels,
-			context.settings.defaultThinking || context.parentThinking || "off",
-		),
-		"thinking",
-	);
 	const now = new Date().toISOString();
 	const record: AgentRecord = {
 		version: 1,
@@ -755,8 +706,8 @@ export async function resumeSubagent(record: AgentRecord, message: string, conte
 		if (!isTerminalStatus(record.status) || isRecordedProcessAlive(record)) throw new Error(`${record.name} is still running`);
 		const maxDepth = Math.min(record.maxDepth, context.settings.maxDepth);
 		if (record.depth > maxDepth) throw new Error(`Subagent depth limit reached (${record.depth}/${maxDepth})`);
-		resolveChildModel(record.model, context.scopedModels);
-		resolveChildThinking(record.thinking, record.model, context.scopedModels, "off");
+		// Saved selectors are identities, never aliases (including legacy bare IDs).
+		const savedModel = resolveSavedModelSelection(record.model, record.thinking, context);
 		if (!record.tools) throw new Error("Subagent has no saved tool allowlist; cannot safely resume");
 		resolveChildTools(record.tools, context.parentTools);
 		if (!record.sessionFile) throw new Error(`${record.name} has no saved session to resume`);
@@ -776,6 +727,8 @@ export async function resumeSubagent(record: AgentRecord, message: string, conte
 		if (context.signal?.aborted) throw new Error("Subagent message was aborted");
 		const next = claimRecordForResume(context.agentDir, record, context.resultRoute);
 		next.maxDepth = maxDepth;
+		next.model = savedModel.model;
+		next.thinking = savedModel.thinking;
 		context.onRecord?.(next);
 		await launchRun({ task: message }, { ...context, settings: { ...context.settings, maxDepth } }, next, record.sessionFile);
 	};
@@ -980,6 +933,7 @@ async function runSubagentProcess(
 					PI_SUBAGENT_DEPTH: String(record.depth),
 					PI_SUBAGENT_MAX_DEPTH: String(context.settings.maxDepth),
 					PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: context.settings.maxDepthFlagOverride ? "1" : "0",
+					[MODEL_CONFIG_ENV]: serializeModelSettings(context.settings),
 				},
 			});
 			ownChild(record.runId, child, () => record.pidStartTime);
