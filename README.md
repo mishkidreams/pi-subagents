@@ -199,7 +199,9 @@ main · openai-codex/gpt-5.5
 
 - Press **Down** at the bottom edge of the editor to inspect subagents.
 - Press **Up/Down** to select; **Enter/Right** to open a child transcript; **x** stops a running child.
-- Transcripts use a **fullscreen, frameless focused overlay**. It covers the parent conversation, with the actual child's identity/status pinned above, a message field and controls below, and a persistent scrollbar. UI labels are English.
+- Transcripts use a **fullscreen, frameless focused overlay**. It covers the parent conversation, with the actual child's identity/status pinned above, a message field and controls below, and a persistent scrollbar. UI labels are English; redundant scroll-mode labels and line counters are omitted.
+- Pinned identity, model and **Path** share one row when they fit, expanding to two/three rows as needed. Home-relative paths use `~`. Click only the **Path** area to copy the full, unchanged working directory, even if clipped. Success feedback expires after two seconds; failures remain visible for retry. A pending copy is not duplicated, and its late completion cannot hide a newer send failure. Path stays available in tested 18×8 and larger layouts.
+- **Ctrl+O** toggles tools and **Ctrl+T** toggles thinking in the selected child only, honoring remapped/disabled Pi action bindings. With the matching compact-transcript fork, click a compact tool/thinking row for local disclosure; grouped calls retain individual selection. Main-chat visibility, the message draft and saved history are unchanged. This integration requires the companion fork's optional synchronous renderer-scope protocol, not a new npm dependency.
 - **Up/Down**, **PageUp/PageDown**, the mouse wheel and dragging/clicking the scrollbar affect only the child history. Page size follows the available transcript height.
 - Click **Start** to read from the beginning or **Latest** to resume following new messages. Reading older history does not jump when more lines are appended. **Ctrl+Home/End** are optional shortcuts; plain **Home/End** still edit the message field.
 - Type a message and press **Enter** to steer or continue the child. A pending send cannot be duplicated by repeated Enter. Failed sends retain the draft for retry, and each child has its own in-memory draft/editor state (not persisted across reload/restart).
@@ -216,6 +218,11 @@ node continuation.test.cjs
 node history.test.cjs
 node routing.test.cjs
 node panel-view.test.cjs
+node panel-path.test.cjs
+node panel-path.test.cjs --layout
+node panel-draft.test.cjs
+node panel-transcript.test.cjs
+node panel-transcript.test.cjs --stock
 node panel-refresh.test.cjs
 node panel-performance.test.cjs
 ```
@@ -225,6 +232,10 @@ node panel-performance.test.cjs
 `continuation.test.cjs` exercises the actual extension tool and RPC lifecycle with an offline Node fixture. It covers exited-session resume, repeated/concurrent messages, stale writers/close markers, concurrency admission/abort/retry, RPC rejection and capability/history boundaries. Process identity probes are stubbed; only owned fixtures may launch or be terminated. This is not a provider-backed live acceptance test.
 
 `history.test.cjs` uses the installed Pi's real `SessionManager` against synthetic JSONL and forbids network, providers and process launches. It covers both sides, compaction, active branches, lossless pagination, delta cursors and invalid/mismatched histories. `routing.test.cjs` uses the actual extension with an offline owned RPC fixture to distinguish quiet manual chat from delegated delivery, previews, idle wakeups, saved read cursors and cross-owner routing; it does not claim physical-terminal or provider-backed acceptance.
+
+`panel-path.test.cjs` checks native mouse dispatch, home boundaries, full-path copy, controlled-clock feedback expiry, overlapping copy/send completion and disposal with an injected clipboard callback only. `--layout` checks responsive one/two/three-row headers and path-only hitboxes after resizing. `panel-draft.test.cjs` uses the real native `CustomEditor` and overlay dispatch: Esc/parent isolation, exact long Unicode restoration, replacement vs concatenation, failed-send retry, empty/repeated Enter, bracketed paste, recipient/acknowledgement isolation, parent undo and memory-only draft lifecycle. Only explicit Enter in the child field sends that field; reopening never submits it or inserts it into the parent editor. Draft handling itself was not rewritten for these controls.
+
+`panel-transcript.test.cjs` loads the actual installed Pi and compact-transcript checkout (`PI_COMPACT_TRANSCRIPT_ROOT` may override the sibling path). Native SGR/key dispatch covers selected/grouped calls, thinking, scrolled coordinates, append, branch replacement, config/reload, two children with colliding call IDs, parent/draft isolation and no session writes. `--stock` omits compact-transcript: native generic tool output stays fully available and thinking controls work without the optional adapter. These are memory-terminal controls, not live provider/physical-terminal acceptance.
 
 Source files are organized by responsibility:
 
@@ -237,8 +248,8 @@ Source files are organized by responsibility:
 - `owner-control.ts` — cross-process requests/acknowledgements routed through the target's creating session; revoked requests abort pending admission
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
-- `transcript.ts` — rendering child session files
-- `transcript-viewport.ts` — view-only history position, follow mode and scrollbar
+- `transcript.ts` — cached native child components, view-only disclosure and optional renderer-scope isolation
+- `transcript-viewport.ts` — view-only history position, follow mode, scrollbar and painted mouse-coordinate translation
 
 ## Publishing
 

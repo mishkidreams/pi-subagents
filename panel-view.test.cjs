@@ -66,6 +66,7 @@ const theme = { fg: (_c, t) => String(t), bg: (_c, t) => String(t), bold: t => S
     let screen = frame();
     assert.ok(!screen.some(l => l.includes('PARENT_SENTINEL')), 'the child view must cover the parent, including all terminal edges');
     assert.ok(screen[0].includes('actual-child-name'), 'actual child identity is pinned at top');
+    assert.ok(!/\b(?:FOLLOW|HISTORY)\b|\d+[–-]\d+\/\d+/.test(screen.slice(0,4).join('\n')), 'header omits redundant scroll modes and line counters');
     assert.ok(screen.at(-1).includes('Esc'), 'navigation help is pinned at bottom');
     assert.ok(screen.some(l => l.includes('Message this subagent')), 'message field stays visible');
     assert.ok(screen.some(l => /[█░]/.test(l)), 'the transcript has a persistent visible scrollbar');

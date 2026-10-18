@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import {
 	CustomEditor,
+	copyToClipboard,
 	getAgentDir,
 	getMarkdownTheme,
 	type ExtensionAPI,
@@ -372,6 +373,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				if (!panel) {
 					panel = new SubagentPanel(tui, theme, getAgentDir(), runtime!.runId, {
 						onMessage: async (record, text) => sendToRecord(record, text, undefined, "manual"),
+						onCopyPath: copyToClipboard,
 						onCancel: (record) => {
 							try {
 								const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
