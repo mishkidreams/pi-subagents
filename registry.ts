@@ -261,8 +261,8 @@ export class StaleSubagentProcessError extends Error {
 	constructor() { super("Subagent process has been replaced by a resumed process"); }
 }
 
-export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
-	return saveRecordWithRenameMode(agentDir, record, true);
+export function saveRecord(agentDir: string, record: AgentRecord, options?: { retryRename?: boolean }): AgentRecord {
+	return saveRecordWithRenameMode(agentDir, record, options?.retryRename !== false);
 }
 
 /** Message admission can wait for a Windows open handle, but must not block its close callbacks. */
@@ -315,12 +315,12 @@ export function claimRecordForResume(agentDir: string, record: AgentRecord, resu
 }
 
 /** Mark a child PID as permanently cleared before writing its final record. */
-export function clearRecordPid(agentDir: string, record: AgentRecord): AgentRecord {
+export function clearRecordPid(agentDir: string, record: AgentRecord, options?: { retryRename?: boolean }): AgentRecord {
 	const dir = registryDir(agentDir);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const target = closedPath(agentDir, record);
-	if (!existsSync(target)) atomicWrite(target, `${new Date().toISOString()}\n`);
-	return saveRecord(agentDir, { ...record, pid: undefined, pidStartTime: undefined });
+	if (!existsSync(target)) atomicWrite(target, `${new Date().toISOString()}\n`, options?.retryRename !== false);
+	return saveRecord(agentDir, { ...record, pid: undefined, pidStartTime: undefined }, options);
 }
 
 export function isRecordCancelled(agentDir: string, runId: string): boolean {

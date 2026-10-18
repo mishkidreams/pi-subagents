@@ -11,17 +11,29 @@ const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-routing-'));
 const fixture = path.join(sandbox, 'rpc-fixture.cjs');
 const keys = ['PI_CODING_AGENT_DIR', 'PI_SUBAGENT_COMMAND', 'PI_SUBAGENT_RUN_ID', 'PI_SUBAGENT_ROOT_ID'];
 const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
-const original = { spawn: cp.spawn, execFile: cp.execFile, execFileSync: cp.execFileSync, renameSync: fs.renameSync };
+const original = { spawn: cp.spawn, execFile: cp.execFile, execFileSync: cp.execFileSync, renameSync: fs.renameSync, readdirSync: fs.readdirSync };
+let measureProgressScans = false, progressScans = 0;
+fs.readdirSync = (file, ...args) => {
+  if (measureProgressScans && path.resolve(String(file)) === path.join(sandbox,'subagents','runs')) progressScans++;
+  return original.readdirSync(file,...args);
+};
 let renameFault;
 fs.renameSync = (from,to) => {
   if (renameFault && String(to) === renameFault.target && (!renameFault.onlyStatus || JSON.parse(fs.readFileSync(from,'utf8')).status === renameFault.onlyStatus)) {
     if (renameFault.notify && !renameFault.notified) { renameFault.notified=true;fs.writeFileSync(renameFault.notify,'start'); }
+    if (renameFault.onFault && !renameFault.notified) { renameFault.notified=true;renameFault.onFault(); }
     const error = Object.assign(new Error('fixture rename is locked until the event loop can progress'), {code:renameFault.code || 'EPERM',syscall:'rename'});
     throw error;
   }
   return original.renameSync(from,to);
 };
 const children = new Set();
+const keepAliveTimers = new Set();
+const nativeSetInterval = global.setInterval, nativeClearInterval = global.clearInterval;
+global.setInterval = (callback,ms,...args) => {
+  const timer=nativeSetInterval(callback,ms,...args);if(ms===60000)keepAliveTimers.add(timer);return timer;
+};
+global.clearInterval = timer => {keepAliveTimers.delete(timer);return nativeClearInterval(timer);};
 cp.execFileSync = () => { throw new Error('OFFLINE: synchronous OS integration forbidden'); };
 cp.execFile = (file, args, options, callback) => {
   assert.match(file, /powershell\.exe$/i);
@@ -65,7 +77,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
  } else accepted();
  if (!busy) { busy = true; emit({type:'agent_start'}); }
  emit({type:'message_end',message:user}); clearTimeout(timer);
- const finish = () => { const message = {role:'assistant',content:[{type:'text',text:'reply: '+command.message}],timestamp:Date.now()}; append(message); emit({type:'message_end',message}); busy = false; emit({type:'agent_settled'}); };
+ let progressTimer;
+ const finish = () => { clearInterval(progressTimer); const message = {role:'assistant',content:[{type:'text',text:'reply: '+command.message}],timestamp:Date.now()}; append(message); emit({type:'message_end',message}); busy = false; emit({type:'agent_settled'}); };
+ if (command.message.startsWith('SLOW_STREAM')) progressTimer=setInterval(()=>emit({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'PUBLIC_STREAM_PROGRESS '}}),20);
  if (command.message.startsWith('SLOW')) {
   const token = file + '.' + command.message; fs.writeFileSync(token+'.ready','ready');
   timer = setInterval(() => { if(fs.existsSync(token+'.release')) { clearInterval(timer); finish(); } },5);
@@ -120,6 +134,32 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     const check = () => tools.get('check_subagents').execute('check',{wait:false},undefined,undefined,ctx);
     const send = (message,signal) => tools.get('send_to_subagent').execute('send',{target:'child',message},signal,undefined,ctx);
     const preview = () => handlers.get('tool_result')({content:[{type:'text',text:'ordinary parent tool'}]},ctx);
+    await send('SLOW_STREAM_RESPONSIVENESS');
+    let blockedMs;
+    const released = new Promise(resolve => {
+      renameFault = {target,onlyStatus:'thinking',onFault:()=>{
+        const start=performance.now();setTimeout(()=>{blockedMs=performance.now()-start;renameFault=undefined;resolve();},25);
+      }};
+    });
+    try {
+      await Promise.race([released,sleep(3000).then(()=>{throw new Error('streaming fixture never attempted a registry write');})]);
+      assert.ok(blockedMs<150,`streaming persistence must yield to input timers, not block ${blockedMs.toFixed(1)}ms in a synchronous Windows rename retry`);
+      console.log('ok - active RPC progress cannot block input while a Windows rename needs an event-loop callback');
+      progressScans=0;measureProgressScans=true;
+      await sleep(300);measureProgressScans=false;
+      assert.equal(progressScans,0,'progress publication must not synchronously rescan every historical child record');
+      console.log('ok - progress callbacks update liveness without a synchronous full-registry scan');
+      const terminalWriteBlocked = new Promise(resolve => {renameFault={target,onlyStatus:'completed',onFault:resolve};});
+      fs.writeFileSync(file+'.SLOW_STREAM_RESPONSIVENESS.release','release');
+      await Promise.race([terminalWriteBlocked,sleep(3000).then(()=>{throw new Error('terminal fixture write did not reach its retry boundary');})]);
+      await sleep(40);
+      assert.equal(keepAliveTimers.size,1,'an unpersisted settlement must keep a print-mode parent alive for the scheduled retry');
+      renameFault=undefined;
+      await until(()=>row()?.latestText==='reply: SLOW_STREAM_RESPONSIVENESS' && row()?.status==='completed' && keepAliveTimers.size===0);
+      console.log('ok - print-mode liveness outlasts failed terminal persistence and releases after successful retry');
+    } finally {measureProgressScans=false;renameFault=undefined;fs.writeFileSync(file+'.SLOW_STREAM_RESPONSIVENESS.release','release');}
+    await check();
+    if (process.argv.includes('--progress-check')) {console.log('ALL PROGRESS TESTS PASS');return;}
     await manual('MANUAL_ONE');
     assert.equal(preview(),undefined,'manual child reply must NOT append to an unrelated parent tool result');
     handlers.get('agent_settled')(); await sleep(50);
@@ -287,7 +327,8 @@ async function until(predicate) { const end = Date.now() + 5000; while (!predica
     console.log('ALL ROUTING TESTS PASS');
   } finally {
     try { await handlers.get('session_shutdown')?.({}, {mode:'rpc'}); } catch {}
-    panel?.dispose();fs.renameSync=original.renameSync;
+    panel?.dispose();fs.renameSync=original.renameSync;fs.readdirSync=original.readdirSync;
+    global.setInterval=nativeSetInterval;global.clearInterval=nativeClearInterval;
     for (const child of children) if (child.exitCode===null && child.signalCode===null) child.kill();
     if (runtime) await runtime.terminateOwnedSubagents(['child']);
     Object.assign(cp,original);

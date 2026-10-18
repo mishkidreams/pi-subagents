@@ -226,6 +226,8 @@ node panel-performance.test.cjs
 
 `history.test.cjs` uses the installed Pi's real `SessionManager` against synthetic JSONL and forbids network, providers and process launches. It covers both sides, compaction, active branches, lossless pagination, delta cursors and invalid/mismatched histories. `routing.test.cjs` uses the actual extension with an offline owned RPC fixture to distinguish quiet manual chat from delegated delivery, previews, idle wakeups, saved read cursors and cross-owner routing; it does not claim physical-terminal or provider-backed acceptance.
 
+`routing.test.cjs --progress-check` isolates live progress persistence: transient rename retries must yield to timers, progress must not rescan the whole historical registry, and failed terminal persistence must keep print-mode parents alive until retry succeeds. Owner progress/close callbacks use single-attempt writes plus their existing asynchronous retry; other synchronous registry callers retain their default retry contract. This does not claim that all registry I/O or process admission is asynchronous.
+
 Source files are organized by responsibility:
 
 - `index.ts` — Pi registration, lifecycle hooks, tools, delivery, and UI wiring

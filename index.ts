@@ -121,6 +121,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let deliveryDueAt = 0;
 	let deliveryRetryDelay = 1000;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
+	const activeChildren = new Set<string>();
 	let stopOwnerConsumer: (() => Promise<void>) | undefined;
 	let sessionAbort = new AbortController();
 	let shuttingDown = false;
@@ -186,11 +187,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 
 	/** Hold the event loop open while background children run (matters for print-mode parents). */
-	const refreshKeepAlive = () => {
-		if (!runtime || shuttingDown) return;
-		const pending = readRecords(getAgentDir()).some(
-			(record) => record.parentRunId === runtime!.runId && !isTerminalStatus(record.status),
-		);
+	const refreshKeepAlive = (record: AgentRecord) => {
+		if (!runtime || shuttingDown || record.parentRunId !== runtime.runId) return;
+		// Only persisted updates change membership: a failed terminal write must
+		// keep print-mode parents alive until its asynchronous retry succeeds.
+		if (isTerminalStatus(record.status)) activeChildren.delete(record.runId);
+		else activeChildren.add(record.runId);
+		const pending = activeChildren.size > 0;
 		if (pending && !keepAlive) {
 			keepAlive = setInterval(() => {}, 60000);
 		} else if (!pending && keepAlive) {
@@ -417,7 +420,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			scopedModels: ctx.scopedModels.map(({ model, thinkingLevel }) => ({ provider: model.provider, id: model.id, thinkingLevel })),
 			parentCwd: ctx.cwd, projectTrusted: runtime.projectTrusted,
 			persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc", signal,
-			onRecord: trackChild, onSettled: trackChild,
+			onRecord: trackChild, onSettled: notifyChild,
 			onUiRequest: async (child, request) => {
 				const title = `[${child.name}] ${request.title || "Subagent request"}`;
 				const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
@@ -441,11 +444,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		};
 	};
 
-	const trackChild = (record: AgentRecord) => {
+	const notifyChild = (record: AgentRecord) => {
 		if (shuttingDown) return;
-		refreshKeepAlive();
 		notifyWaiters(getAgentDir());
 		if (isTerminalStatus(record.status)) scheduleDelivery();
+	};
+	const trackChild = (record: AgentRecord) => {
+		if (shuttingDown) return;
+		refreshKeepAlive(record);
+		notifyChild(record);
 	};
 
 	const resolveRecord = (target: string): AgentRecord => {
@@ -517,6 +524,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			clearInterval(keepAlive);
 			keepAlive = undefined;
 		}
+		activeChildren.clear();
 		sessionAbort.abort();
 		const consumerStopped = stopOwnerConsumer?.();
 		stopOwnerConsumer = undefined;

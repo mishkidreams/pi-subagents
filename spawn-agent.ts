@@ -854,7 +854,8 @@ async function runSubagentProcess(
 	};
 	const publish = () => {
 		try {
-			Object.assign(record, saveRecord(context.agentDir, record));
+			// These callbacks already retry asynchronously: never sleep on the UI thread.
+			Object.assign(record, saveRecord(context.agentDir, record, { retryRename: false }));
 			context.onRecord?.(record);
 			retryAttempt = 0;
 		} catch (error) {
@@ -865,7 +866,7 @@ async function runSubagentProcess(
 	};
 	const publishClosed = () => {
 		try {
-			Object.assign(record, clearRecordPid(context.agentDir, record));
+			Object.assign(record, clearRecordPid(context.agentDir, record, { retryRename: false }));
 			context.onRecord?.(record);
 			retryAttempt = 0;
 		} catch (error) {
