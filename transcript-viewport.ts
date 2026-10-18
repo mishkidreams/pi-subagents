@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 
 /** View-only position. Keeping an absolute top preserves reading during append;
  * following the end is an explicit, independent state. No session data is edited.
@@ -8,6 +8,7 @@ export class TranscriptViewport {
 	private total = 0;
 	private height = 0;
 	private following = true;
+	private width = 0;
 
 	scrollBy(lines: number): boolean {
 		const before = this.top;
@@ -31,7 +32,8 @@ export class TranscriptViewport {
 		this.following = bounded === 1;
 	}
 
-	render(body: string[], width: number, height: number, style: (text: string) => string): { lines: string[]; position: string; mode: "FOLLOW" | "HISTORY" } {
+	render(body: string[], width: number, height: number, style: (text: string) => string): { lines: string[] } {
+		this.width = width;
 		this.total = body.length;
 		this.height = Math.max(0, height);
 		const maxTop = Math.max(0, this.total - this.height);
@@ -44,9 +46,13 @@ export class TranscriptViewport {
 			const bar = style(row >= thumbTop && row < thumbTop + thumb ? "█" : "░");
 			return width < 2 ? truncateToWidth(bar, width, "") : text + " ".repeat(Math.max(0, width - 1 - visibleWidth(text))) + bar;
 		});
-		const end = Math.min(this.total, this.top + this.height);
-		const start = end ? this.top + 1 : 0;
-		const mode = this.following ? "FOLLOW" : "HISTORY";
-		return { lines, position: `${start}–${end}/${this.total} · ${mode}`, mode };
+		return { lines };
+	}
+
+	/** Translate the last painted viewport, never its scrollbar or padding column. */
+	contentMouse(event: TuiMouseEvent): TuiMouseEvent | undefined {
+		const textWidth = Math.max(0, this.width - 2);
+		if (event.x < 0 || event.x >= textWidth || event.y < 0 || event.y >= this.height || event.y + this.top >= this.total) return undefined;
+		return { ...event, y: event.y + this.top, width: textWidth, height: this.total };
 	}
 }

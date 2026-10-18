@@ -1,8 +1,10 @@
 import { statSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
+import { isAbsolute, relative, sep } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
 	Input,
+	getKeybindings,
 	Key,
 	matchesKey,
 	truncateToWidth,
@@ -16,7 +18,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords, readRecordsAsync, registryDir } from "./registry.ts";
-import { buildTranscript, discoverSessionFile } from "./transcript.ts";
+import { TranscriptView, discoverSessionFile } from "./transcript.ts";
 import { TranscriptViewport } from "./transcript-viewport.ts";
 import type { AgentRecord } from "./types.ts";
 
@@ -27,10 +29,12 @@ const SCROLL_PAGE = 20;
 const OVERLAY_MARGIN = 0;
 const REGISTRY_DEBOUNCE_MS = 30;
 const REGISTRY_POLL_MS = 1000;
+const COPY_FEEDBACK_MS = 2000;
 
 interface SubagentPanelOptions {
 	onMessage?: (record: AgentRecord, text: string) => Promise<void>;
 	onCancel?: (record: AgentRecord) => void;
+	onCopyPath?: (path: string) => Promise<void>;
 }
 
 interface DetailState {
@@ -41,11 +45,19 @@ interface DetailState {
 	sending: boolean;
 	status?: string;
 	error?: boolean;
+	copying?: boolean;
+	copyStatus?: string;
+	copyError?: boolean;
+	copyFeedbackTimer?: ReturnType<typeof setTimeout>;
+	transcript?: { key: string; view: TranscriptView };
 }
 
 function shortPath(path: string): string {
-	const home = homedir();
-	return path === home ? "~" : path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+	const suffix = relative(homedir(), path);
+	if (!suffix) return "~";
+	return suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix)
+		? `~/${suffix.split(sep).join("/")}`
+		: path;
 }
 
 function elapsed(record: AgentRecord): string {
@@ -98,7 +110,6 @@ export class SubagentPanel implements Component, Focusable {
 	private reviewing = false;
 	private editor?: Component;
 	private mainModel?: string;
-	private transcript: { key: string; components: Component[] } | null = null;
 	private transcriptFile?: string;
 	private lastDiscover = 0;
 	private detailRunId?: string;
@@ -106,10 +117,12 @@ export class SubagentPanel implements Component, Focusable {
 	private messageInput = new Input();
 	private detailGeometry?: {
 		width: number; bodyTop: number; bodyHeight: number; inputY: number; controlsY: number;
+		pathY?: number; pathStart: number; pathEnd: number; cwd: string;
 		buttons: { start: number; end: number; action: "back" | "start" | "latest" }[];
 	};
 	private draggingScrollbar = false;
 	private pressedDetailButton?: "back" | "start" | "latest";
+	private pressedPath?: { runId: string; path: string };
 	private detailOverlay?: SubagentDetailOverlay;
 	private overlayHandle?: OverlayHandle;
 	private timer: ReturnType<typeof setInterval>;
@@ -145,6 +158,7 @@ export class SubagentPanel implements Component, Focusable {
 			state.draft = value;
 			const revision = state.revision;
 			state.sending = true;
+			this.clearCopyFeedback(state);
 			state.error = false;
 			state.status = "Sending…";
 			state.viewport.scrollToEnd();
@@ -162,6 +176,7 @@ export class SubagentPanel implements Component, Focusable {
 				},
 				(error) => {
 					state.sending = false;
+					this.clearCopyFeedback(state);
 					state.error = true;
 					state.status = `Send failed: ${error instanceof Error ? error.message : String(error)} · Enter retry`;
 					if (!this.disposed) this.tui.requestRender();
@@ -268,7 +283,6 @@ export class SubagentPanel implements Component, Focusable {
 		this.messageInput = state.input;
 		this.messageInput.setValue(state.draft);
 		if (this.detailRunId !== record.runId) {
-			this.transcript = null;
 			this.transcriptFile = undefined;
 		}
 		this.detailRunId = record.runId;
@@ -294,11 +308,52 @@ export class SubagentPanel implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
+	private clearCopyFeedback(state: DetailState): void {
+		if (state.copyFeedbackTimer) clearTimeout(state.copyFeedbackTimer);
+		state.copyFeedbackTimer = undefined;
+		state.copyStatus = undefined;
+		state.copyError = false;
+	}
+
+	private copyPath(record: AgentRecord, value: string): void {
+		const state = this.stateFor(record.runId);
+		if (state.copying || !this.options.onCopyPath) return;
+		this.clearCopyFeedback(state);
+		state.copying = true;
+		state.copyError = false;
+		state.copyStatus = "Copying path…";
+		this.tui.requestRender();
+		void Promise.resolve().then(() => this.options.onCopyPath!(value)).then(
+			() => {
+				if (this.disposed || state.copyStatus !== "Copying path…") return;
+				state.copyStatus = "Copied path";
+				state.copyFeedbackTimer = setTimeout(() => {
+					this.clearCopyFeedback(state);
+					if (!this.disposed && this.detail && this.detailRunId === record.runId) this.tui.requestRender();
+				}, COPY_FEEDBACK_MS);
+				state.copyFeedbackTimer.unref?.();
+			},
+			(error) => {
+				if (this.disposed || state.copyStatus !== "Copying path…") return;
+				state.copyError = true;
+				state.copyStatus = `Copy failed: ${error instanceof Error ? error.message : String(error)}`;
+			},
+		).finally(() => {
+			state.copying = false;
+			if (!this.disposed) this.tui.requestRender();
+		});
+	}
+
 	private closeDetail(): void {
-		if (this.detailRunId) this.stateFor(this.detailRunId).draft = this.messageInput.getValue();
+		if (this.detailRunId) {
+			const state = this.stateFor(this.detailRunId);
+			state.draft = this.messageInput.getValue();
+			this.clearCopyFeedback(state);
+		}
 		this.detail = false;
 		this.draggingScrollbar = false;
 		this.pressedDetailButton = undefined;
+		this.pressedPath = undefined;
 		this.detailGeometry = undefined;
 		this.messageInput.focused = false;
 		const handle = this.overlayHandle;
@@ -434,7 +489,19 @@ export class SubagentPanel implements Component, Focusable {
 		}
 		if (event.button !== "left") return undefined;
 		const pressed = this.pressedDetailButton;
-		if (event.type === "release") this.pressedDetailButton = undefined;
+		const pressedPath = this.pressedPath;
+		if (event.type === "release") {
+			this.pressedDetailButton = undefined;
+			this.pressedPath = undefined;
+		}
+		if (event.y === geometry.pathY && event.x >= geometry.pathStart && event.x < geometry.pathEnd && this.options.onCopyPath) {
+			if (event.type === "press") {
+				this.pressedPath = { runId: record.runId, path: geometry.cwd };
+				return { handled: true, capture: true };
+			}
+			if (event.type === "release" && pressedPath?.runId === record.runId) this.copyPath(record, pressedPath.path);
+			return { handled: true };
+		}
 		if (event.y === geometry.controlsY) {
 			const button = geometry.buttons.find(b => event.x >= b.start && event.x < b.end);
 			if (!button) return undefined;
@@ -449,6 +516,12 @@ export class SubagentPanel implements Component, Focusable {
 				this.tui.requestRender();
 			}
 			return { handled: true };
+		}
+		if (event.y >= geometry.bodyTop && event.y < geometry.bodyTop + geometry.bodyHeight) {
+			const local = viewport.contentMouse({ ...event, y: event.y - geometry.bodyTop });
+			const result = local ? this.stateFor(record.runId).transcript?.view.handleMouse(local) : undefined;
+			if (result) this.tui.requestRender();
+			return result;
 		}
 		if (event.y === geometry.inputY) {
 			const result = this.messageInput.handleMouse({ ...event, y: 0 });
@@ -476,7 +549,12 @@ export class SubagentPanel implements Component, Focusable {
 			if (!record) return;
 			const state = this.stateFor(record.runId);
 			const page = Math.max(1, (this.detailGeometry?.bodyHeight ?? SCROLL_PAGE) - 1);
-			if (matchesKey(data, Key.ctrl("home"))) state.viewport.scrollToStart();
+			const bindings = getKeybindings();
+			const matchesAppKey = (action: "app.tools.expand" | "app.thinking.toggle", fallback: "o" | "t") => bindings.getDefinition(action)
+				? bindings.matches(data, action) : matchesKey(data, Key.ctrl(fallback));
+			if (matchesAppKey("app.tools.expand", "o")) this.transcriptView(record)?.toggleTools();
+			else if (matchesAppKey("app.thinking.toggle", "t")) this.transcriptView(record)?.toggleThinking();
+			else if (matchesKey(data, Key.ctrl("home"))) state.viewport.scrollToStart();
 			else if (matchesKey(data, Key.ctrl("end"))) state.viewport.scrollToEnd();
 			else if (matchesKey(data, Key.up)) state.viewport.scrollBy(-SCROLL_STEP);
 			else if (matchesKey(data, Key.down)) state.viewport.scrollBy(SCROLL_STEP);
@@ -586,7 +664,7 @@ export class SubagentPanel implements Component, Focusable {
 		return lines.map((line) => truncateToWidth(line, width, ""));
 	}
 
-	private transcriptComponents(record: AgentRecord): Component[] | null {
+	private transcriptView(record: AgentRecord): TranscriptView | null {
 		const file = record.sessionFile ?? this.transcriptFile;
 		if (!file) {
 			const now = Date.now();
@@ -609,11 +687,16 @@ export class SubagentPanel implements Component, Focusable {
 		} catch {
 			return null;
 		}
-		if (!this.transcript || this.transcript.key !== key) {
-			const components = buildTranscript(file, this.tui, record.cwd);
-			this.transcript = components ? { key, components } : null;
+		const state = this.stateFor(record.runId);
+		if (!state.transcript || state.transcript.key !== key) {
+			const view = state.transcript?.view ?? new TranscriptView(this.tui, record.cwd);
+			if (!view.update(file)) {
+				if (!state.transcript) view.dispose();
+				return null;
+			}
+			state.transcript = { key, view };
 		}
-		return this.transcript?.components ?? null;
+		return state.transcript?.view ?? null;
 	}
 
 	private legacyDetail(record: AgentRecord, width: number): string[] {
@@ -640,18 +723,38 @@ export class SubagentPanel implements Component, Focusable {
 		const icon = this.theme.fg(statusColor(record), statusIcon(record));
 		const title = `Subagent: ${icon} ${this.theme.bold(oneLine(record.name))} · ${record.status} · ${elapsed(record)}`;
 		const divider = this.theme.fg("dim", "─".repeat(Math.max(0, width)));
-		const header = [title];
-		if (height >= 5) header.push(""); // Filled with model/position after measuring the body viewport.
+		const segments = [{ text: title, path: false }];
+		if (height >= 5) segments.push({ text: this.theme.fg("dim", oneLine(`${record.model}${record.thinking !== "off" ? `:${record.thinking}` : ""}${width >= 80 ? ` · #${record.runId.slice(0, 8)}` : ""}`)), path: false });
+		if (height >= 7) segments.push({ text: this.theme.fg("muted", `Path: ${oneLine(shortPath(record.cwd))}`), path: true });
+		const header: string[] = [];
+		let pathY: number | undefined;
+		let pathStart = 0;
+		let pathEnd = 0;
+		for (const segment of segments) {
+			const previous = header.at(-1);
+			const prefix = previous === undefined ? "" : previous + this.theme.fg("dim", " · ");
+			const fits = previous !== undefined && visibleWidth(prefix + segment.text) <= width;
+			if (fits) header[header.length - 1] = prefix + segment.text;
+			else header.push(segment.text);
+			if (segment.path) {
+				pathY = header.length - 1;
+				pathStart = fits ? visibleWidth(prefix) : 0;
+				pathEnd = Math.min(width, pathStart + visibleWidth(segment.text));
+			}
+		}
 		if (height >= 9) header.push(divider);
+		const status = state.copyStatus ?? state.status;
+		const error = state.copyStatus ? state.copyError : state.error;
 		const footer = [
 			...(height >= 9 ? [divider] : []),
-			...(height >= 6 ? [this.theme.fg(state.error ? "error" : "muted", `${state.status ? `${oneLine(state.status)} · ` : ""}Message this subagent · Enter send`)] : []),
+			...(height >= 6 ? [this.theme.fg(error ? "error" : "muted", `${status ? `${oneLine(status)} · ` : ""}Message this subagent · Enter send`)] : []),
 			...this.messageInput.render(width).slice(0, 1),
 		];
 		const textWidth = Math.max(1, width - 2);
-		const components = this.transcriptComponents(record);
-		const body = components?.length ? components.flatMap(component => component.render(textWidth).map(clean)) : this.legacyDetail(record, textWidth);
-		if (components?.length && record.activity === "responding" && record.latestText) {
+		const transcript = this.transcriptView(record);
+		const rendered = transcript?.render(textWidth);
+		const body = rendered?.length ? rendered.map(clean) : this.legacyDetail(record, textWidth);
+		if (rendered?.length && record.activity === "responding" && record.latestText) {
 			body.push("", this.theme.fg("dim", "live"), ...wrapTextWithAnsi(record.latestText, textWidth));
 		}
 		const view = state.viewport.render(body, width, Math.max(0, height - header.length - footer.length - 1), text => this.theme.fg("dim", text));
@@ -662,15 +765,8 @@ export class SubagentPanel implements Component, Focusable {
 			column += visibleWidth(label) + 1;
 			return { start, end: column - 1, action: (["back", "start", "latest"] as const)[index] };
 		});
-		if (height >= 5) {
-			const position = width >= 40 ? view.position : view.mode;
-			const separator = width >= 40 ? " · " : " ";
-			const modelWidth = Math.max(1, width - visibleWidth(position) - visibleWidth(separator));
-			const model = truncateToWidth(oneLine(`${record.model}${record.thinking !== "off" ? `:${record.thinking}` : ""}`), modelWidth, "…");
-			header[1] = this.theme.fg("dim", `${model}${separator}${position}${width >= 80 ? ` · #${record.runId.slice(0, 8)} · ${oneLine(shortPath(record.cwd))}` : ""}`);
-		}
 		const help = this.theme.fg("dim", `${labels.join(" ")}${width >= 40 ? " · PgUp/PgDn" : ""}`);
-		this.detailGeometry = { width, bodyTop: header.length, bodyHeight: view.lines.length, inputY: height - 2, controlsY: height - 1, buttons };
+		this.detailGeometry = { width, bodyTop: header.length, bodyHeight: view.lines.length, inputY: height - 2, controlsY: height - 1, buttons, pathY, pathStart, pathEnd, cwd: record.cwd };
 		const lines = height < 4 ? [title, ...footer].slice(0, height - 1).concat(help) : [...header, ...view.lines, ...footer, help];
 		// Fill every cell and row: overlay transparency must never expose the parent.
 		return Array.from({ length: height }, (_, row) => {
@@ -681,10 +777,15 @@ export class SubagentPanel implements Component, Focusable {
 
 	invalidate(): void {
 		this.messageInput.invalidate();
+		for (const state of this.detailStates.values()) state.transcript?.view.invalidate();
 	}
 
 	dispose(): void {
 		this.disposed = true;
+		for (const state of this.detailStates.values()) {
+			this.clearCopyFeedback(state);
+			state.transcript?.view.dispose();
+		}
 		this.watcher?.close();
 		this.watcher = undefined;
 		if (this.refreshTimer) clearTimeout(this.refreshTimer);
