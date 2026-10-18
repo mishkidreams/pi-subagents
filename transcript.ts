@@ -92,6 +92,7 @@ class ChunkedText implements Component {
 		}
 	}
 	render(): string[] { return [`[${this.label} · preparing large payload]`]; }
+	invalidate(): void { /* Immutable content with no local render cache. */ }
 }
 
 type CachedEntry = { component: Component; source: unknown; result?: unknown };

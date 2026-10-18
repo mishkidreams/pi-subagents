@@ -65,7 +65,7 @@ async function test(name, run) {
   catch (error) { failures++; console.error('FAIL - ' + name + ': ' + error.stack); }
 }
 (async () => {
-  let handlers, ctx;
+  let handlers, ctx, shutdownDone = false;
   const tools = new Map();
   const registry = await jiti.import(path.join(__dirname, 'registry.ts'));
   const wait = await jiti.import(path.join(__dirname, 'wait.ts'));
@@ -198,10 +198,25 @@ async function test(name, run) {
         await old.catch(() => {});
       }
     });
+    await test('extension shutdown terminates its history worker instead of retaining its thread and caches', async () => {
+      const { Worker } = require('node:worker_threads');
+      const post = Worker.prototype.postMessage, owned = new Set();
+      Worker.prototype.postMessage = function(message, ...args) {
+        if (message.kind === 'page') owned.add(this);
+        return post.call(this, message, ...args);
+      };
+      try {
+        await tools.get('read_subagent_messages').execute('before-shutdown', {target:'active', fromStart:true}, undefined, undefined, ctx);
+      } finally { Worker.prototype.postMessage = post; }
+      assert.equal(owned.size, 1, 'exercise the real background history reader');
+      await handlers.get('session_shutdown')({}, ctx);
+      shutdownDone = true;
+      assert.ok([...owned].every(worker => worker.threadId === -1), 'the history worker must be terminated, not merely unrefed, when this extension unloads');
+    });
   } finally {
     measuring = false;
     await (await jiti.import(path.join(__dirname, 'session-reader.ts'))).disposeSessionReaderAsync();
-    if (handlers) await handlers.get('session_shutdown')({}, ctx);
+    if (handlers && !shutdownDone) await handlers.get('session_shutdown')({}, ctx);
     if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousDir;
     fs.rmSync(sandbox, { recursive:true, force:true, maxRetries:10, retryDelay:50 });
   }
